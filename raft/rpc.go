@@ -26,14 +26,34 @@ func (n *Node) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		return resp, nil
 	}
 
+	// // CRITICAL FIX: If same term and I'm leader, reject!
+	// if req.Term == n.currentTerm && n.state == Leader {
+	// 	log.Printf("[%s] Rejected vote for %s: I'm leader at same term %d",
+	// 		n.id, req.CandidateId, n.currentTerm)
+	// 	return resp, nil
+	// }
+
+	// CRITICAL FIX: If I'm follower and recently heard from leader, reject
+	// (This prevents disrupting stable leadership)
+	// if req.Term == n.currentTerm && n.leaderID != "" && n.leaderID != req.CandidateId {
+	// 	log.Printf("[%s] Rejected vote for %s: already have leader %s at term %d",
+	// 		n.id, req.CandidateId, n.leaderID, n.currentTerm)
+	// 	return resp, nil
+	// }
+
 	// if RPC request contains term T > currentTerm, set currentTerm = T and convert to follower
 	if req.Term > n.currentTerm {
+		log.Printf("[%s] Received higher term %d from %s (my term: %d), stepping down",
+			n.id, req.Term, req.CandidateId, n.currentTerm)
+
 		n.currentTerm = req.Term
 		n.votedFor = ""
 		n.state = Follower
+		n.leaderID = "" // Clear leader on new term
 
 		if n.heartbeatTimer != nil {
 			n.heartbeatTimer.Stop()
+			n.heartbeatTimer = nil
 		}
 		n.resetElectionTimer()
 
@@ -52,6 +72,8 @@ func (n *Node) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 	} else {
 		log.Printf("[%s] Rejected vote for %s: already voted for %s", n.id, req.CandidateId, n.votedFor)
 	}
+
+	resp.Term = n.currentTerm
 
 	return resp, nil
 }
@@ -86,14 +108,70 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		log.Printf("[%s] Became FOLLOWER at term %d", n.id, n.currentTerm)
 	}
 
+	if n.leaderID != req.LeaderId {
+		n.leaderID = req.LeaderId
+		log.Printf("[%s] Recognized leader: %s at term %d", n.id, req.LeaderId, req.Term)
+	}
+
 	// Reset election timer on valid AppendEntries
 	n.resetElectionTimer()
 
-	// Heartbeat received
+	// Heartbeat (no entries)
 	if len(req.Entries) == 0 {
-		log.Printf("[%s] Received heartbeat from %s for term %d", n.id, req.LeaderId, req.Term)
+		// log.Printf("[%s] Heartbeat from leader %s (term %d)", n.id, req.LeaderId, req.Term)
+
+		// Update commitIndex from leader
+		if req.LeaderCommit > n.commitIndex {
+			oldCommit := n.commitIndex
+			n.commitIndex = min(req.LeaderCommit, uint64(len(n.log)))
+			log.Printf("[%s] Updated commitIndex from %d to %d", n.id, oldCommit, n.commitIndex)
+			go n.applyEntries()
+		}
+
 		resp.Success = true
 		return resp, nil
+	}
+
+	// Log repication - Consistency check
+	if req.PrevLogIndex > 0 {
+		// Check if we have entry at prevLogIndex
+		if req.PrevLogIndex > uint64(len(n.log)) {
+			log.Printf("[%s] Rejected AppendEntries: log too short (prevLogIndex=%d, len=%d)", n.id, req.PrevLogIndex, len(n.log))
+			return resp, nil
+		}
+
+		// Check if term matches
+		if n.log[req.PrevLogIndex-1].Term != req.PrevLogTerm {
+			log.Printf("[%s] Rejected AppendEntries: term missmatch at index %d (have %d, want %d)", n.id, req.PrevLogIndex, n.log[req.PrevLogIndex-1].Term, req.PrevLogTerm)
+			return resp, nil
+		}
+	}
+
+	// Consistency check passed, append entries
+	for i, entry := range req.Entries {
+		idx := req.PrevLogIndex + uint64(i) + 1
+
+		// If existing entry conflicts, delete it and all following
+		if idx <= uint64(len(n.log)) {
+			if n.log[idx-1].Term != entry.Term {
+				log.Printf("[%s] Conflict at index %d, truncating log", n.id, idx)
+				n.log = n.log[:idx-1]
+			} else {
+				continue // Entry already exists and matches
+			}
+		}
+
+		// Append new entry
+		n.log = append(n.log, entry)
+		log.Printf("[%s] Appended entry index=%d term=%d", n.id, entry.Index, entry.Term)
+	}
+
+	// Update commitIndex
+	if req.LeaderCommit > n.commitIndex {
+		oldCommit := n.commitIndex
+		n.commitIndex = min(req.LeaderCommit, uint64(len(n.log)))
+		log.Printf("[%s] Updated commitIndex from %d to %d", n.id, oldCommit, n.commitIndex)
+		go n.applyEntries()
 	}
 
 	resp.Success = true
