@@ -27,6 +27,6 @@ func (s NodeState) String() string {
 // Timeouts
 const (
 	HeartbeatInterval  = 100 * time.Millisecond
-	ElectionTimeoutMin = 1000 * time.Millisecond
+	ElectionTimeoutMin = 1500 * time.Millisecond
 	ElectionTimeoutMax = 3000 * time.Millisecond
 )

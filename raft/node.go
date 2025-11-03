@@ -185,6 +185,7 @@ func (n *Node) replicateToPeer(peerID string) {
 		// Don't spam logs for heartbeat failures to down nodes
 		if len(entries) > 0 {
 			log.Printf("[%s] Failed to replicate to %s: %v", n.id, peerID, err)
+			return
 		}
 		return
 	}
@@ -374,13 +375,32 @@ func (n *Node) getClient(peerID string) (pb.RaftClient, error) {
 	return client, nil
 }
 
+// isLogUpToDate checks if candidate's log is at least as up-to-date as ours
+// If the logs have last entries with different terms, then the log with the later term is
+// more up-to-date. If the logs end with the same term, then whichever log is longer is
+// more up-to-date
+func (n *Node) isLogUpToDate(candidateLastLogIndex, candidateLastLogTerm uint64) bool {
+	// get our last log info
+	var lastLogIndex, lastLogTerm uint64
+	if len(n.log) > 0 {
+		lastEntry := n.log[len(n.log)-1]
+		lastLogIndex = lastEntry.Index
+		lastLogTerm = lastEntry.Term
+	}
+
+	// Candidate's log is more up-to-date if:
+	// 1. Last term is higher, OR
+	// 2. Same term but longer log
+	if candidateLastLogTerm != lastLogTerm {
+		return candidateLastLogTerm > lastLogTerm
+	}
+	return candidateLastLogIndex >= lastLogIndex
+}
+
 func (n *Node) Start() {
 	initialDelay := time.Duration(rand.Int63n(2000)) * time.Millisecond
 	log.Printf("[%s] Starting node as %s (initial delay: %v)", n.id, n.state, initialDelay)
-
 	time.Sleep(initialDelay)
-
-	log.Printf("[%s] Became FOLLOWER at term 0", n.id)
 	n.mu.Lock()
 	n.becomeFollower(0)
 	n.mu.Unlock()
@@ -451,11 +471,20 @@ func (n *Node) becomeLeader() {
 
 	log.Printf("[%s] Became LEADER at term %d (lastLogIndex=%d)", n.id, n.currentTerm, lastLogIndex)
 
+	// Send Immediate heartbeat to estabilish authority
+	go func() {
+		n.mu.Lock()
+		if n.state == Leader {
+			log.Printf("[%s] Sending immediate heartbeat to estabilish leadership", n.id)
+			n.mu.Unlock()
+			n.replicateToAll()
+		} else {
+			n.mu.Unlock()
+		}
+	}()
+
 	// Start sending heartbeats
 	go n.sendHeartbeats()
-
-	// // Immediate first heartbeat
-	// go n.replicateToAll()
 }
 
 func (n *Node) resetElectionTimer() {

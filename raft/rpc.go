@@ -26,45 +26,52 @@ func (n *Node) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		return resp, nil
 	}
 
-	// // CRITICAL FIX: If same term and I'm leader, reject!
-	// if req.Term == n.currentTerm && n.state == Leader {
-	// 	log.Printf("[%s] Rejected vote for %s: I'm leader at same term %d",
-	// 		n.id, req.CandidateId, n.currentTerm)
-	// 	return resp, nil
-	// }
-
-	// CRITICAL FIX: If I'm follower and recently heard from leader, reject
-	// (This prevents disrupting stable leadership)
-	// if req.Term == n.currentTerm && n.leaderID != "" && n.leaderID != req.CandidateId {
-	// 	log.Printf("[%s] Rejected vote for %s: already have leader %s at term %d",
-	// 		n.id, req.CandidateId, n.leaderID, n.currentTerm)
-	// 	return resp, nil
-	// }
+	// CRITICAL: If I'm leader at same term, reject
+	if req.Term == n.currentTerm && n.state == Leader {
+		log.Printf("[%s] Rejected vote for %s: I'm leader at same term %d",
+			n.id, req.CandidateId, n.currentTerm)
+		return resp, nil
+	}
 
 	// if RPC request contains term T > currentTerm, set currentTerm = T and convert to follower
+	shouldStepDown := false
 	if req.Term > n.currentTerm {
 		log.Printf("[%s] Received higher term %d from %s (my term: %d), stepping down",
 			n.id, req.Term, req.CandidateId, n.currentTerm)
 
+		shouldStepDown = true
 		n.currentTerm = req.Term
 		n.votedFor = ""
-		n.state = Follower
-		n.leaderID = "" // Clear leader on new term
 
-		if n.heartbeatTimer != nil {
-			n.heartbeatTimer.Stop()
-			n.heartbeatTimer = nil
+		// Only step down if we're not already follower
+		if n.state != Follower && shouldStepDown {
+			log.Printf("[%s] Stepping down from %s to FOLLOWER", n.id, n.state)
+			n.state = Follower
+			n.leaderID = "" // Clear leader on new term
+
+			if n.heartbeatTimer != nil {
+				n.heartbeatTimer.Stop()
+				n.heartbeatTimer = nil
+			}
 		}
+
 		n.resetElectionTimer()
 
 		log.Printf("[%s] Became FOLLOWER at term %d", n.id, n.currentTerm)
 	}
 
+	// Check if candidate's log is up-to-date
+	if !n.isLogUpToDate(req.LastLogIndex, req.LastLogTerm) {
+		log.Printf("[%s] Rejected vote for %s: log not up-to-date (candidate: idx=%d term=%d, mine: idx=%d term=%d)",
+			n.id, req.CandidateId, req.LastLogIndex, req.LastLogTerm,
+			n.getLastLogIndex(), n.getLastLogTerm())
+		return resp, nil
+	}
+
 	// Grant vote if:
 	// 1. Haven't voted or already voted for this candidate
-	// 2. Candidate's log is at leat as up-to-date as receiver's log
+	// 2. Candidate's log is at least as up-to-date as receiver's log
 	if n.votedFor == "" || n.votedFor == req.CandidateId {
-		// Simplified: assuming candidate's log is always up-to-date
 		n.votedFor = req.CandidateId
 		resp.VoteGranted = true
 		n.resetElectionTimer()
@@ -102,6 +109,7 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 
 		if n.heartbeatTimer != nil {
 			n.heartbeatTimer.Stop()
+			n.heartbeatTimer = nil
 		}
 		n.resetElectionTimer()
 
@@ -118,8 +126,6 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 
 	// Heartbeat (no entries)
 	if len(req.Entries) == 0 {
-		// log.Printf("[%s] Heartbeat from leader %s (term %d)", n.id, req.LeaderId, req.Term)
-
 		// Update commitIndex from leader
 		if req.LeaderCommit > n.commitIndex {
 			oldCommit := n.commitIndex
@@ -176,4 +182,22 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 
 	resp.Success = true
 	return resp, nil
+}
+
+// Helpers
+
+func (n *Node) getLastLogIndex() uint64 {
+	if len(n.log) == 0 {
+		return 0
+	}
+
+	return n.log[len(n.log)-1].Index
+}
+
+func (n *Node) getLastLogTerm() uint64 {
+	if len(n.log) == 0 {
+		return 0
+	}
+
+	return n.log[len(n.log)-1].Term
 }
