@@ -43,6 +43,9 @@ func (n *Node) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		n.currentTerm = req.Term
 		n.votedFor = ""
 
+		n.storage.SaveTerm(n.currentTerm)
+		n.storage.SaveVote(n.votedFor)
+
 		// Only step down if we're not already follower
 		if n.state != Follower && shouldStepDown {
 			log.Printf("[%s] Stepping down from %s to FOLLOWER", n.id, n.state)
@@ -130,7 +133,11 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		if req.LeaderCommit > n.commitIndex {
 			oldCommit := n.commitIndex
 			n.commitIndex = min(req.LeaderCommit, uint64(len(n.log)))
-			log.Printf("[%s] Updated commitIndex from %d to %d", n.id, oldCommit, n.commitIndex)
+			// Only log if actually changed
+			if n.commitIndex != oldCommit {
+				log.Printf("[%s] Updated commitIndex from %d to %d", n.id, oldCommit, n.commitIndex)
+				go n.applyEntries()
+			}
 			go n.applyEntries()
 		}
 
@@ -161,10 +168,19 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		if idx <= uint64(len(n.log)) {
 			if n.log[idx-1].Term != entry.Term {
 				log.Printf("[%s] Conflict at index %d, truncating log", n.id, idx)
+
+				// Truncate on disk
+				n.storage.TruncateLogFrom(idx)
 				n.log = n.log[:idx-1]
 			} else {
 				continue // Entry already exists and matches
 			}
+		}
+
+		// Persist to disk FIRST
+		if err := n.storage.AppendLog(entry); err != nil {
+			log.Printf("[%s] Failed to persist log entry: %v", n.id, err)
+			return resp, nil
 		}
 
 		// Append new entry
@@ -176,7 +192,11 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 	if req.LeaderCommit > n.commitIndex {
 		oldCommit := n.commitIndex
 		n.commitIndex = min(req.LeaderCommit, uint64(len(n.log)))
-		log.Printf("[%s] Updated commitIndex from %d to %d", n.id, oldCommit, n.commitIndex)
+		// Only log if actually changed
+		if n.commitIndex != oldCommit {
+			log.Printf("[%s] Updated commitIndex from %d to %d", n.id, oldCommit, n.commitIndex)
+			go n.applyEntries()
+		}
 		go n.applyEntries()
 	}
 

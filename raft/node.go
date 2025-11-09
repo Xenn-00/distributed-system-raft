@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"path/filepath"
 	"sync"
 	"time"
 
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
 	"github.com/Xenn-00/distributed-kv-store/kv"
+	"github.com/Xenn-00/distributed-kv-store/storage"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -48,10 +50,20 @@ type Node struct {
 
 	// State machine (KV store)
 	kvStore *kv.KVStore
+
+	// Storage
+	storage *storage.BadgerStorage
 }
 
-func NewNode(id string, peers map[string]string) *Node {
+func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) {
 	rand.Seed(time.Now().UnixNano() + int64(len(id)))
+
+	// Open Storage
+	stor, err := storage.NewBadgerStroage(filepath.Join(dataDir, id))
+	if err != nil {
+		return nil, fmt.Errorf("failed to open storage: %v", err)
+	}
+
 	node := &Node{
 		id:          id,
 		state:       Follower,
@@ -67,8 +79,78 @@ func NewNode(id string, peers map[string]string) *Node {
 		shutdownCh:  make(chan struct{}),
 		clients:     make(map[string]pb.RaftClient),
 		kvStore:     kv.NewKVStore(),
+		storage:     stor,
 	}
-	return node
+
+	// Restore from disk
+	if err := node.restoreFromStorage(); err != nil {
+		return nil, fmt.Errorf("failed to restore from storage: %v", err)
+	}
+	return node, nil
+}
+
+// restoreFromStorage loads persistent state from disk
+func (n *Node) restoreFromStorage() error {
+	// Load term
+	term, err := n.storage.LoadTerm()
+	if err != nil {
+		return err
+	}
+	n.currentTerm = term
+
+	// Load vote
+	votedFor, err := n.storage.LoadVote()
+	if err != nil {
+		return err
+	}
+	n.votedFor = votedFor
+
+	// Load log
+	logs, err := n.storage.GetAllLogs()
+	if err != nil {
+		return err
+	}
+	n.log = logs
+
+	// Load snapshot if exist
+	if n.storage.HasSnapshot() {
+		lastIncludedIndex, lastIncludedTerm, data, err := n.storage.LoadSnapshot()
+		if err != nil {
+			return err
+		}
+
+		log.Printf("[%s] Loaded snapshot: lastIncludedIndex=%d, lastIncludedterm=%d", n.id, lastIncludedIndex, lastIncludedTerm)
+
+		// Restore KV state from snapshot
+		var kvState map[string]string
+		if err := json.Unmarshal(data, &kvState); err != nil {
+			return err
+		}
+
+		for k, v := range kvState {
+			n.kvStore.Set(k, v)
+		}
+
+		n.lastApplied = lastIncludedIndex
+		n.commitIndex = lastIncludedIndex
+	}
+
+	log.Printf("[%s] Restored from storage: term=%d, votedFor=%s, log entries=%d", n.id, n.currentTerm, n.votedFor, len(n.log))
+
+	// Replay log entries after snapshot
+	if n.lastApplied < uint64(len(n.log)) {
+		log.Printf("[%s] Replaying %d log entries", n.id, uint64(len(n.log))-n.lastApplied)
+
+		for i := n.lastApplied; i < uint64(len(n.log)); i++ {
+			entry := n.log[i]
+			if err := n.kvStore.Apply(entry.Command); err != nil {
+				log.Printf("[%s] Failed to apply entry %d: %v", n.id, entry.Index, err)
+			}
+			n.lastApplied = entry.Index
+		}
+	}
+
+	return nil
 }
 
 // Propose: propose a new command to the cluster (only leader)
@@ -94,7 +176,12 @@ func (n *Node) Propose(cmd kv.Command) error {
 		Command: cmdBytes,
 	}
 
-	// Append to local log
+	// Persist to WAL FIRST
+	if err := n.storage.AppendLog(entry); err != nil {
+		return fmt.Errorf("failed to persiste log: %v", err)
+	}
+
+	// Then append to memory
 	n.log = append(n.log, entry)
 	log.Printf("[%s] Proposed entry index=%d term=%d cmd=%+v", n.id, entry.Index, entry.Term, cmd)
 
@@ -437,12 +524,21 @@ func (n *Node) becomeFollower(term uint64) {
 }
 
 func (n *Node) becomeCandidate() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	// Caller should hold n.mu.lock
+	// n.mu.Lock()
+	// defer n.mu.Unlock()
 
 	n.state = Candidate // Change node's state to candidate
 	n.currentTerm++     // Increment current term (starting a new election)
 	n.votedFor = n.id   // vote for self
+
+	// Persist state
+	if err := n.storage.SaveTerm(n.currentTerm); err != nil {
+		log.Printf("[%s] Failed to save term: %v", n.id, err)
+	}
+	if err := n.storage.SaveVote(n.votedFor); err != nil {
+		log.Printf("[%s] Failed to save vote: %v", n.id, err)
+	}
 
 	log.Printf("[%s] Became CANDIDATE at term %d", n.id, n.currentTerm)
 }
@@ -633,5 +729,8 @@ func (n *Node) Shutdown() {
 	close(n.shutdownCh)
 	if n.heartbeatTimer != nil {
 		n.heartbeatTimer.Stop()
+	}
+	if n.storage != nil {
+		n.storage.Close()
 	}
 }

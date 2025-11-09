@@ -20,6 +20,7 @@ func main() {
 	// Application entry point
 	nodeID := flag.String("id", "node1", "Node ID")
 	address := flag.String("addr", "localhost:5001", "Node address")
+	dataDir := flag.String("data", "./data", "Data directory")
 	flag.Parse()
 
 	// Harcoded 3-node cluster for demonstration
@@ -29,10 +30,13 @@ func main() {
 		"node3": "localhost:5003",
 	}
 
-	log.Printf("Starting Raft node: %s at %s", *nodeID, *address)
+	log.Printf("Starting Raft node: %s at %s (data: %s)", *nodeID, *address, *dataDir)
 
 	// Create Raft node
-	node := raft.NewNode(*nodeID, peers)
+	node, err := raft.NewNode(*nodeID, peers, *dataDir)
+	if err != nil {
+		log.Fatalf("Failed to create node: %v", err)
+	}
 	node.Start()
 
 	// Start gRPC server
