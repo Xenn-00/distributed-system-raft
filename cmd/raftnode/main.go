@@ -163,6 +163,18 @@ func main() {
 				leaderID := node.GetLeaderID()
 				leaderAddr := node.GetLeaderAddress()
 
+				// Get snapshot info
+				hasSnapshot := node.HasSnapshot()
+				var snapInfo string
+				if hasSnapshot {
+					lastIdx, lastTerm := node.GetSnapshotInfo()
+					snapInfo = fmt.Sprintf("Yes (lastIndex=%d, lastTerm=%d)", lastIdx, lastTerm)
+				} else {
+					snapInfo = "No"
+				}
+
+				logSize := node.GetLogSize()
+
 				fmt.Printf("Node: %s\n", *nodeID)
 				fmt.Printf("Leader: %v\n", isLeader)
 
@@ -173,6 +185,9 @@ func main() {
 						fmt.Println("Current Leader: Unknown (election in progress)")
 					}
 				}
+
+				fmt.Printf("Log Entries: %d\n", logSize)
+				fmt.Printf("Snapshot: %s\n", snapInfo)
 
 			default:
 				fmt.Println("Unknown command. Type 'help' for usage.")

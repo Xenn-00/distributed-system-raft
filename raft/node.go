@@ -53,11 +53,28 @@ type Node struct {
 
 	// Storage
 	storage *storage.BadgerStorage
+
+	// Snapshot tracking
+	lastSnapshotTime  time.Time
+	lastSnapshotIndex uint64
+
+	// Rate limiting for failed replications
+	replicationFailures map[string]int       // peerID -> consecutive failures
+	lastFailureTime     map[string]time.Time // peerID -> last failure time
 }
 
-func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) {
-	rand.Seed(time.Now().UnixNano() + int64(len(id)))
+const (
+	// Snapshot ever N log entries
+	SnapshotThreshold = 10 // Set low for testing, production could use 10000+
 
+	// Time-based trigger
+	SnapshotInterval = 3 * time.Minute
+
+	// Minimum entries before time-based snapshot
+	MinEntriesForSnapshot = 5 // Don't snapshot if <5 entries
+)
+
+func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) {
 	// Open Storage
 	stor, err := storage.NewBadgerStroage(filepath.Join(dataDir, id))
 	if err != nil {
@@ -65,21 +82,25 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 	}
 
 	node := &Node{
-		id:          id,
-		state:       Follower,
-		peers:       peers,
-		currentTerm: 0,
-		votedFor:    "",
-		log:         make([]*pb.LogEntry, 0),
-		commitIndex: 0,
-		lastApplied: 0,
-		leaderID:    "",
-		nextIndex:   make(map[string]uint64),
-		matchIndex:  make(map[string]uint64),
-		shutdownCh:  make(chan struct{}),
-		clients:     make(map[string]pb.RaftClient),
-		kvStore:     kv.NewKVStore(),
-		storage:     stor,
+		id:                  id,
+		state:               Follower,
+		peers:               peers,
+		currentTerm:         0,
+		votedFor:            "",
+		log:                 make([]*pb.LogEntry, 0),
+		commitIndex:         0,
+		lastApplied:         0,
+		leaderID:            "",
+		nextIndex:           make(map[string]uint64),
+		matchIndex:          make(map[string]uint64),
+		shutdownCh:          make(chan struct{}),
+		clients:             make(map[string]pb.RaftClient),
+		kvStore:             kv.NewKVStore(),
+		storage:             stor,
+		lastSnapshotTime:    time.Now(),
+		lastSnapshotIndex:   0,
+		replicationFailures: make(map[string]int),
+		lastFailureTime:     make(map[string]time.Time),
 	}
 
 	// Restore from disk
@@ -218,24 +239,91 @@ func (n *Node) replicateToPeer(peerID string) {
 		return
 	}
 
+	// Rate limiting: Skip if too many recent failures
+	failures := n.replicationFailures[peerID]
+	lastFail := n.lastFailureTime[peerID]
+
+	if failures > 0 {
+		// Exponential backoff: 100ms, 200ms, 400ms, 800ms, max 5s
+		backoff := min(time.Duration(100*(1<<uint(failures-1)))*time.Millisecond, 5*time.Second)
+
+		if time.Since(lastFail) < backoff {
+			// Too soon to retry, skip
+			n.mu.Unlock()
+			return
+		}
+	}
+
 	// Get next index for this peer
 	nextIdx := n.nextIndex[peerID]
 	if nextIdx == 0 {
 		nextIdx = 1
 	}
 
+	// Check if we need to send snapshot
+	var firstLogIndex uint64 = 1
+	if len(n.log) > 0 {
+		firstLogIndex = n.log[0].Index
+	} else if n.storage.HasSnapshot() {
+		snapIndex, _, _, _ := n.storage.LoadSnapshot()
+		firstLogIndex = snapIndex + 1
+	}
+
+	// If nextIndex is behind our first log entry, send snapshot
+	if nextIdx < firstLogIndex {
+		log.Printf("[%s] Peer %s is too far behind (nextIndex=%d, firstLogIndex=%d)", n.id, peerID, nextIdx, firstLogIndex)
+		n.mu.Unlock()
+		n.sendSnapshot(peerID)
+		return
+	}
+
+	// Get last log index
+	var lastLogIndex uint64
+	if len(n.log) > 0 {
+		lastLogIndex = n.log[len(n.log)-1].Index
+	} else {
+		lastLogIndex = firstLogIndex - 1
+	}
+
 	// Get entries to send
 	var entries []*pb.LogEntry
-	if nextIdx <= uint64(len(n.log)) {
-		entries = n.log[nextIdx-1:] // Send from nextIdx to end
+	if nextIdx <= lastLogIndex {
+		// Find entries from nextIdx onwards
+		for _, entry := range n.log {
+			if entry.Index >= nextIdx {
+				entries = append(entries, entry)
+			}
+		}
 	}
 
 	// Get previous log entry info for consistency check
 	var prevLogIndex, prevLogTerm uint64
 	if nextIdx > 1 {
 		prevLogIndex = nextIdx - 1
-		if prevLogIndex <= uint64(len(n.log)) {
-			prevLogTerm = n.log[prevLogIndex-1].Term
+
+		// Check if prevLogIndex is in snapshot
+		if n.storage.HasSnapshot() {
+			snapIndex, snapTerm, _, _ := n.storage.LoadSnapshot()
+			if prevLogIndex == snapIndex {
+				prevLogTerm = snapTerm
+			}
+		}
+
+		// Check if prevLogIndex is in log
+		if prevLogTerm == 0 {
+			for _, entry := range n.log {
+				if entry.Index == prevLogIndex {
+					prevLogTerm = entry.Term
+					break
+				}
+			}
+		}
+
+		// If still not found, something wrong
+		if prevLogTerm == 0 {
+			log.Printf("[%s] ERROR: Cannot find prevLogTerm for index %d", n.id, prevLogIndex)
+			n.mu.Unlock()
+			return
 		}
 	}
 
@@ -247,9 +335,15 @@ func (n *Node) replicateToPeer(peerID string) {
 	// Get client
 	client, err := n.getClient(peerID)
 	if err != nil {
-		// Only log if we have entries to send (avoid spam for heartbeats)
-		if len(entries) > 0 {
-			log.Printf("[%s] Failed to get client for %s: %v", n.id, peerID, err)
+		// Mark failure
+		n.mu.Lock()
+		n.replicationFailures[peerID]++
+		n.lastFailureTime[peerID] = time.Now()
+		n.mu.Unlock()
+
+		// Only log first few failures
+		if n.replicationFailures[peerID] <= 3 {
+			log.Printf("[%s] Failed to get client for %s: %v (failure %d)", n.id, peerID, err, n.replicationFailures[peerID])
 		}
 		return
 	}
@@ -269,10 +363,15 @@ func (n *Node) replicateToPeer(peerID string) {
 
 	resp, err := client.AppendEntries(ctx, req)
 	if err != nil {
-		// Don't spam logs for heartbeat failures to down nodes
-		if len(entries) > 0 {
-			log.Printf("[%s] Failed to replicate to %s: %v", n.id, peerID, err)
-			return
+		// Mark failure
+		n.mu.Lock()
+		n.replicationFailures[peerID]++
+		n.lastFailureTime[peerID] = time.Now()
+		n.mu.Unlock()
+
+		// Only log first few failures
+		if len(entries) > 0 && n.replicationFailures[peerID] <= 3 {
+			log.Printf("[%s] Failed to replicate to %s: %v (failure %d)", n.id, peerID, err, n.replicationFailures[peerID])
 		}
 		return
 	}
@@ -282,6 +381,10 @@ func (n *Node) replicateToPeer(peerID string) {
 		// Heartbeat success (log every 10th heartbeat to reduce noise)
 		// Or just don't log at all
 	} else {
+		n.mu.Lock()
+		n.replicationFailures[peerID] = 0
+		delete(n.lastFailureTime, peerID)
+		n.mu.Unlock()
 		log.Printf("[%s] Replicated %d entries to %s", n.id, len(entries), peerID)
 	}
 
@@ -300,6 +403,10 @@ func (n *Node) replicateToPeer(peerID string) {
 		n.votedFor = ""
 		n.state = Follower
 		n.leaderID = ""
+
+		// Persist state change
+		n.storage.SaveTerm(n.currentTerm)
+		n.storage.SaveVote(n.votedFor)
 		if n.heartbeatTimer != nil {
 			n.heartbeatTimer.Stop()
 			n.heartbeatTimer = nil
@@ -326,7 +433,6 @@ func (n *Node) replicateToPeer(peerID string) {
 		if n.nextIndex[peerID] > 1 {
 			n.nextIndex[peerID]--
 			log.Printf("[%s] Peer %s rejected, decrementing nextIndex to %d", n.id, peerID, n.nextIndex[peerID])
-			go n.replicateToPeer(peerID) // Retry
 		}
 	}
 }
@@ -335,10 +441,22 @@ func (n *Node) replicateToPeer(peerID string) {
 func (n *Node) updateCommitIndex() {
 	// Caller must hold n.mu
 
+	lastLogIndex := n.getLastLogIndex()
+
 	// Find highest N where majority has replicated
-	for N := n.commitIndex + 1; N <= uint64(len(n.log)); N++ {
-		if n.log[N-1].Term != n.currentTerm {
-			continue // Only consider entries from current term
+	for N := n.commitIndex + 1; N <= lastLogIndex; N++ {
+		// Find entry at index N
+		var entryTerm uint64
+		for _, entry := range n.log {
+			if entry.Index == N {
+				entryTerm = entry.Term
+				break
+			}
+		}
+
+		// Only commit entries from current term (Raft safety)
+		if entryTerm != n.currentTerm {
+			continue
 		}
 
 		count := 1 // Leader itself
@@ -350,7 +468,7 @@ func (n *Node) updateCommitIndex() {
 
 		majority := len(n.peers)/2 + 1
 		if count >= majority {
-			log.Printf("[%s] Advancing commitIndex from %d to %d (majority confirmed)", n.id, n.commitIndex, N)
+			log.Printf("[%s] Advancing commitIndex from %d to %d (majority confirmed: %d/%d)", n.id, n.commitIndex, N, count, len(n.peers))
 			n.commitIndex = N
 
 			// Apply commited entries
@@ -368,7 +486,21 @@ func (n *Node) applyEntries() {
 
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		entry := n.log[n.lastApplied-1]
+
+		// Find entry by Index
+
+		var entry *pb.LogEntry
+		for _, e := range n.log {
+			if e.Index == n.lastApplied {
+				entry = e
+				break
+			}
+		}
+
+		if entry == nil {
+			log.Printf("[%s] ERROR: Entry at index %d not found in log", n.id, n.lastApplied)
+			continue
+		}
 
 		log.Printf("[%s] Applying entry index=%d term=%d", n.id, entry.Index, entry.Term)
 
@@ -376,11 +508,9 @@ func (n *Node) applyEntries() {
 			log.Printf("[%s] Failed to apply entry %d: %v", n.id, entry.Index, err)
 		}
 	}
-}
 
-// GetKvStore returns the KV store (for client queries)
-func (n *Node) GetKVStore() *kv.KVStore {
-	return n.kvStore
+	// Trigger snapshot check after applying entries
+	go n.maybeSnapshot()
 }
 
 // Isleader checks if this node is the leader
@@ -388,41 +518,6 @@ func (n *Node) IsLeader() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.state == Leader
-}
-
-// GetLeaderID returns current leader ID (or empty if unknown)
-func (n *Node) GetLeaderID() string {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	// This is simplified - in real implementation you'd track last known leader
-	if n.state == Leader {
-		return n.id
-	}
-
-	return n.leaderID // Return tracked leader
-}
-
-// GetLeaderAddress return address leader (perfect for redirect)
-func (n *Node) GetLeaderAddress() string {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	leaderID := n.leaderID
-	if n.state == Leader {
-		leaderID = n.id
-	}
-
-	if leaderID == "" {
-		return ""
-	}
-
-	addr, ok := n.peers[leaderID]
-	if !ok {
-		return ""
-	}
-
-	return addr
 }
 
 // Lazy get client with retry
@@ -462,28 +557,6 @@ func (n *Node) getClient(peerID string) (pb.RaftClient, error) {
 	return client, nil
 }
 
-// isLogUpToDate checks if candidate's log is at least as up-to-date as ours
-// If the logs have last entries with different terms, then the log with the later term is
-// more up-to-date. If the logs end with the same term, then whichever log is longer is
-// more up-to-date
-func (n *Node) isLogUpToDate(candidateLastLogIndex, candidateLastLogTerm uint64) bool {
-	// get our last log info
-	var lastLogIndex, lastLogTerm uint64
-	if len(n.log) > 0 {
-		lastEntry := n.log[len(n.log)-1]
-		lastLogIndex = lastEntry.Index
-		lastLogTerm = lastEntry.Term
-	}
-
-	// Candidate's log is more up-to-date if:
-	// 1. Last term is higher, OR
-	// 2. Same term but longer log
-	if candidateLastLogTerm != lastLogTerm {
-		return candidateLastLogTerm > lastLogTerm
-	}
-	return candidateLastLogIndex >= lastLogIndex
-}
-
 func (n *Node) Start() {
 	initialDelay := time.Duration(rand.Int63n(2000)) * time.Millisecond
 	log.Printf("[%s] Starting node as %s (initial delay: %v)", n.id, n.state, initialDelay)
@@ -491,7 +564,34 @@ func (n *Node) Start() {
 	n.mu.Lock()
 	n.becomeFollower(0)
 	n.mu.Unlock()
+	// Start periodic snapshot check
+	go n.periodicSnapshotCheck()
+
+	go n.reportFailures()
 	go n.run()
+}
+
+func (n *Node) reportFailures() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			n.mu.Lock()
+
+			// Report peers with failures
+			for peerID, failures := range n.replicationFailures {
+				if failures > 0 {
+					lastFail := n.lastFailureTime[peerID]
+					log.Printf("[%s] Peer %s: %d consecutive failures (last: %v ago)", n.id, peerID, failures, time.Since(lastFail))
+				}
+			}
+			n.mu.Unlock()
+		case <-n.shutdownCh:
+			return
+		}
+	}
 }
 
 func (n *Node) run() {
@@ -509,10 +609,16 @@ func (n *Node) becomeFollower(term uint64) {
 	// n.mu.Lock()
 	// defer n.mu.Unlock()
 
-	n.state = Follower   // Change node's state to follower
-	n.currentTerm = term // Update current term
-	n.votedFor = ""      // Reset votedFor
-	n.leaderID = ""      // Clear leader when stepping down
+	if term == 0 {
+		n.state = Follower   // Change node's state to follower
+		n.currentTerm = term // Update current term
+		n.votedFor = ""      // Reset votedFor
+		n.leaderID = ""      // Clear leader when stepping down
+	} else {
+		// Already restored from disk
+		n.state = Follower
+		// Keep currentTerm, votedFor as-is
+	}
 
 	// Stop heartbeat timer if running
 	if n.heartbeatTimer != nil {
@@ -549,8 +655,8 @@ func (n *Node) becomeLeader() {
 	n.state = Leader  // Change node's state to leader
 	n.leaderID = n.id // Set self as leader
 
-	// Initialize leader state
-	lastLogIndex := uint64(len(n.log))
+	// Initialize leader state (including snapshot)
+	lastLogIndex := n.getLastLogIndex()
 	for peerID := range n.peers {
 		if peerID == n.id {
 			continue

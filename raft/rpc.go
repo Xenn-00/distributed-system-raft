@@ -2,9 +2,11 @@ package raft
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
+	"github.com/Xenn-00/distributed-kv-store/kv"
 )
 
 // RPC handlers
@@ -34,30 +36,22 @@ func (n *Node) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 	}
 
 	// if RPC request contains term T > currentTerm, set currentTerm = T and convert to follower
-	shouldStepDown := false
 	if req.Term > n.currentTerm {
 		log.Printf("[%s] Received higher term %d from %s (my term: %d), stepping down",
 			n.id, req.Term, req.CandidateId, n.currentTerm)
 
-		shouldStepDown = true
 		n.currentTerm = req.Term
 		n.votedFor = ""
+		n.state = Follower
+		n.leaderID = ""
+
+		if n.heartbeatTimer != nil {
+			n.heartbeatTimer.Stop()
+			n.heartbeatTimer = nil
+		}
 
 		n.storage.SaveTerm(n.currentTerm)
 		n.storage.SaveVote(n.votedFor)
-
-		// Only step down if we're not already follower
-		if n.state != Follower && shouldStepDown {
-			log.Printf("[%s] Stepping down from %s to FOLLOWER", n.id, n.state)
-			n.state = Follower
-			n.leaderID = "" // Clear leader on new term
-
-			if n.heartbeatTimer != nil {
-				n.heartbeatTimer.Stop()
-				n.heartbeatTimer = nil
-			}
-		}
-
 		n.resetElectionTimer()
 
 		log.Printf("[%s] Became FOLLOWER at term %d", n.id, n.currentTerm)
@@ -77,6 +71,8 @@ func (n *Node) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 	if n.votedFor == "" || n.votedFor == req.CandidateId {
 		n.votedFor = req.CandidateId
 		resp.VoteGranted = true
+
+		n.storage.SaveVote(n.votedFor)
 		n.resetElectionTimer()
 		log.Printf("[%s] Granted vote to %s for term %d", n.id, req.CandidateId, req.Term)
 	} else {
@@ -204,20 +200,95 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 	return resp, nil
 }
 
-// Helpers
+// InstallSnapshot handles incoming InstallSnapshot RPCs
+func (n *Node) InstallSnapshot(ctx context.Context, req *pb.InstallSnapshotRequest) (*pb.InstallSnapshotResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-func (n *Node) getLastLogIndex() uint64 {
-	if len(n.log) == 0 {
-		return 0
+	log.Printf("[%s] Received InstallSnapshot from %s: lastIncludedIndex=%d, lastIncludedTerm=%d, size=%d bytes", n.id, req.LeaderId, req.LastIncludedIndex, req.LastIncludedTerm, len(req.Data))
+
+	resp := &pb.InstallSnapshotResponse{
+		Term: n.currentTerm,
 	}
 
-	return n.log[len(n.log)-1].Index
-}
-
-func (n *Node) getLastLogTerm() uint64 {
-	if len(n.log) == 0 {
-		return 0
+	// Reply immediately if term < currentTerm
+	if req.Term < n.currentTerm {
+		log.Printf("[%s] Rejected InstallSnapshot: stale term (%d < %d)", n.id, req.Term, n.currentTerm)
+		return resp, nil
 	}
 
-	return n.log[len(n.log)-1].Term
+	// Convert to follower if higher term
+	if req.Term > n.currentTerm {
+		n.currentTerm = req.Term
+		n.votedFor = ""
+		n.state = Follower
+		n.leaderID = ""
+
+		if n.heartbeatTimer != nil {
+			n.heartbeatTimer.Stop()
+			n.heartbeatTimer = nil
+		}
+
+		n.storage.SaveTerm(n.currentTerm)
+		n.storage.SaveVote(n.votedFor)
+
+		log.Printf("[%s] Become FOLLOWER at term %d", n.id, n.currentTerm)
+	}
+
+	// Track leader
+	if n.leaderID != req.LeaderId {
+		n.leaderID = req.LeaderId
+		log.Printf("[%s] Recognized leader: %s at term %d", n.id, req.LeaderId, req.Term)
+	}
+
+	n.resetElectionTimer()
+
+	// Save snapshot to disk
+	if err := n.storage.SaveSnapshot(req.LastIncludedIndex, req.LastIncludedTerm, req.Data); err != nil {
+		log.Printf("[%s] Failed to save snapshot: %v", n.id, err)
+		return resp, nil
+	}
+
+	// Apply snapshot to state machine
+	var kvState map[string]string
+	if err := json.Unmarshal(req.Data, &kvState); err != nil {
+		log.Printf("[%s] Failed to unmarshal snapshot data: %v", n.id, err)
+		return resp, nil
+	}
+
+	// Clear current KV store
+	n.kvStore = kv.NewKVStore()
+	for k, v := range kvState {
+		n.kvStore.Set(k, v)
+	}
+
+	log.Printf("[%s] Applied snapshot: %d keys restored", n.id, len(kvState))
+
+	// Discard log entries covered by snapshot
+	var newLog []*pb.LogEntry
+	for _, entry := range n.log {
+		if entry.Index > req.LastIncludedIndex {
+			newLog = append(newLog, entry)
+		}
+	}
+
+	// Delete old logs from disk
+	if err := n.storage.TruncateLogFrom(1); err != nil {
+		log.Printf("[%s] Failed to truncate old logs: %v", n.id, err)
+	}
+
+	// Save new log
+	if len(newLog) > 0 {
+		if err := n.storage.AppendLogs(newLog); err != nil {
+			log.Printf("[%s] Failed to save logs: %v", n.id, err)
+		}
+	}
+
+	n.log = newLog
+	n.lastApplied = req.LastIncludedIndex
+	n.commitIndex = req.LastIncludedIndex
+
+	log.Printf("[%s] InstallSnapshot complete: lastApplied=%d, log entries=%d", n.id, n.lastApplied, len(n.log))
+
+	return resp, nil
 }

@@ -28,6 +28,10 @@ func (s *RaftServer) AppendEntries(ctx context.Context, req *pb.AppendEntriesReq
 	return s.node.AppendEntries(ctx, req)
 }
 
+func (s *RaftServer) InstallSnapshot(ctx context.Context, req *pb.InstallSnapshotRequest) (*pb.InstallSnapshotResponse, error) {
+	return s.node.InstallSnapshot(ctx, req)
+}
+
 func (s *RaftServer) Start(address string) error {
 	lis, err := net.Listen("tcp", address)
 	if err != nil {
