@@ -158,11 +158,14 @@ func (n *Node) restoreFromStorage() error {
 
 	log.Printf("[%s] Restored from storage: term=%d, votedFor=%s, log entries=%d", n.id, n.currentTerm, n.votedFor, len(n.log))
 
-	// Replay log entries after snapshot
-	if n.lastApplied < uint64(len(n.log)) {
-		log.Printf("[%s] Replaying %d log entries", n.id, uint64(len(n.log))-n.lastApplied)
+	// Get last log index
+	lastLogIndex := n.getLastLogIndex()
 
-		for i := n.lastApplied; i < uint64(len(n.log)); i++ {
+	// Replay log entries after snapshot
+	if n.lastApplied < lastLogIndex {
+		log.Printf("[%s] Replaying %d log entries", n.id, lastLogIndex-n.lastApplied)
+
+		for i := n.lastApplied; i < lastLogIndex; i++ {
 			entry := n.log[i]
 			if err := n.kvStore.Apply(entry.Command); err != nil {
 				log.Printf("[%s] Failed to apply entry %d: %v", n.id, entry.Index, err)
@@ -190,10 +193,12 @@ func (n *Node) Propose(cmd kv.Command) error {
 		return err
 	}
 
+	// Get last log index (handles snapshot!)
+	lastLogIndex := n.getLastLogIndex()
 	// Create log entry
 	entry := &pb.LogEntry{
 		Term:    n.currentTerm,
-		Index:   uint64(len(n.log)) + 1,
+		Index:   lastLogIndex + 1,
 		Command: cmdBytes,
 	}
 
@@ -304,7 +309,8 @@ func (n *Node) replicateToPeer(peerID string) {
 		// Check if prevLogIndex is in snapshot
 		if n.storage.HasSnapshot() {
 			snapIndex, snapTerm, _, _ := n.storage.LoadSnapshot()
-			if prevLogIndex == snapIndex {
+			if prevLogIndex <= snapIndex {
+				// prevLogIndex is in snapshot, use snapshot's term
 				prevLogTerm = snapTerm
 			}
 		}
@@ -320,10 +326,12 @@ func (n *Node) replicateToPeer(peerID string) {
 		}
 
 		// If still not found, something wrong
-		if prevLogTerm == 0 {
+		if prevLogTerm == 0 && prevLogIndex > 0 {
+			// This shouldn't happen if snapshot logic is correct
+			// But let's be defensive - send empty heartbeat
 			log.Printf("[%s] ERROR: Cannot find prevLogTerm for index %d", n.id, prevLogIndex)
 			n.mu.Unlock()
-			return
+			// Don't return - let it fail gracefully on follower side
 		}
 	}
 
@@ -562,7 +570,17 @@ func (n *Node) Start() {
 	log.Printf("[%s] Starting node as %s (initial delay: %v)", n.id, n.state, initialDelay)
 	time.Sleep(initialDelay)
 	n.mu.Lock()
-	n.becomeFollower(0)
+	// Don't touch term! already loaded from storage
+	// Just reset state
+	n.state = Follower
+	n.leaderID = ""
+
+	// Clear votedFor if it was for ourselves (stale self-vote)
+	if n.votedFor == n.id {
+		n.votedFor = ""
+		n.storage.SaveVote("")
+	}
+	n.resetElectionTimer()
 	n.mu.Unlock()
 	// Start periodic snapshot check
 	go n.periodicSnapshotCheck()
@@ -705,11 +723,13 @@ func (n *Node) startElection() {
 	n.mu.Lock()
 	currentTerm := n.currentTerm
 	candidateId := n.id
-	lastLogIndex := uint64(len(n.log)) // collecting log info from last log entry
-	lastLogTerm := uint64(0)           // collecting term info from last log entry
-	if lastLogIndex > 0 {
-		lastLogTerm = n.log[lastLogIndex-1].Term
-	}
+
+	// Get last log info (handles snapshot automatically)
+	lastLogIndex := n.getLastLogIndex() // collecting log info from last log entry
+	lastLogTerm := n.getLastLogTerm()   // collecting term info from last log entry
+	// if lastLogIndex > 0 {
+	// 	lastLogTerm = n.log[lastLogIndex-1].Term
+	// }
 	n.mu.Unlock()
 
 	log.Printf("[%s] Starting election for term %d", n.id, currentTerm)

@@ -159,8 +159,25 @@ func (n *Node) periodicSnapshotCheck() {
 }
 
 // sendSnapshot sends InstallSnapshot RPC to a peer
+
+// TODO: apply backoff
 func (n *Node) sendSnapshot(peerID string) {
 	n.mu.Lock()
+
+	// Rate limiting: Skip if too many recent failures
+	failures := n.replicationFailures[peerID]
+	lastFail := n.lastFailureTime[peerID]
+
+	if failures > 0 {
+		// Exponential backoff: 100ms, 200ms, 400ms, 800ms, max 5s
+		backoff := min(time.Duration(100*(1<<uint(failures-1)))*time.Millisecond, 5*time.Second)
+
+		if time.Since(lastFail) < backoff {
+			// Too soon to retry, skip
+			n.mu.Unlock()
+			return
+		}
+	}
 
 	// Check if we have a snapshot
 	if !n.storage.HasSnapshot() {
@@ -203,9 +220,23 @@ func (n *Node) sendSnapshot(peerID string) {
 
 	resp, err := client.InstallSnapshot(ctx, req)
 	if err != nil {
-		log.Printf("[%s] InstallSnapshot to %s failed: %v", n.id, peerID, err)
+		// Mark failure
+		n.mu.Lock()
+		n.replicationFailures[peerID]++
+		n.lastFailureTime[peerID] = time.Now()
+		n.mu.Unlock()
+		// Only log first few failures
+		if n.replicationFailures[peerID] <= 3 {
+			log.Printf("[%s] InstallSnapshot to %s failed: %v (failure %d)", n.id, peerID, err, n.replicationFailures[peerID])
+		}
 		return
 	}
+
+	// Clear replication failures
+	n.mu.Lock()
+	n.replicationFailures[peerID] = 0
+	delete(n.lastFailureTime, peerID)
+	n.mu.Unlock()
 
 	n.mu.Lock()
 	defer n.mu.Unlock()

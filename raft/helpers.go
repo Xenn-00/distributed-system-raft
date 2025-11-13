@@ -32,17 +32,18 @@ func (n *Node) getLastLogIndex() uint64 {
 }
 
 func (n *Node) getLastLogTerm() uint64 {
+	// Check log first
 	if len(n.log) > 0 {
-		return n.log[len(n.log)-1].Term
+		return n.log[len(n.log)-1].Term // <- From log
 	}
 
 	// Check snapshot
 	if n.storage.HasSnapshot() {
 		_, snapTerm, _, _ := n.storage.LoadSnapshot()
-		return snapTerm
+		return snapTerm // <- From snapshot
 	}
 
-	return 0
+	return 0 // <- No log and no snapshot
 }
 
 // GetKvStore returns the KV store (for client queries)
