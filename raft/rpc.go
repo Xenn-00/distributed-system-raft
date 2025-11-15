@@ -138,7 +138,7 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		// Update commitIndex from leader
 		if req.LeaderCommit > n.commitIndex {
 			oldCommit := n.commitIndex
-			n.commitIndex = min(req.LeaderCommit, uint64(len(n.log)))
+			n.commitIndex = min(req.LeaderCommit, n.getLastLogIndex())
 			// Only log if actually changed
 			if n.commitIndex != oldCommit {
 				log.Printf("[%s] Updated commitIndex from %d to %d", n.id, oldCommit, n.commitIndex)
@@ -241,6 +241,16 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		oldCommit := n.commitIndex
 		lastLogIndex := n.getLastLogIndex()
 		n.commitIndex = min(req.LeaderCommit, lastLogIndex)
+
+		// Ensure lastApplied doesn't lag behind snapshot
+		if n.storage.HasSnapshot() {
+			snapIndex, _, _, _ := n.storage.LoadSnapshot()
+			if n.lastApplied < snapIndex {
+				n.lastApplied = snapIndex
+				log.Printf("[%s] Adjusted lastApplied to snapshot index %d", n.id, snapIndex)
+			}
+		}
+
 		// Only log if actually changed
 		if n.commitIndex != oldCommit {
 			log.Printf("[%s] Updated commitIndex from %d to %d", n.id, oldCommit, n.commitIndex)

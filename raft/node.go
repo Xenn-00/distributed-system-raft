@@ -153,27 +153,43 @@ func (n *Node) restoreFromStorage() error {
 		}
 
 		n.lastApplied = lastIncludedIndex
-		n.commitIndex = lastIncludedIndex
+		if len(n.log) > 0 {
+			// Assume all restored logs were committed
+			n.commitIndex = max(lastIncludedIndex, n.log[len(n.log)-1].Index)
+		} else {
+			n.commitIndex = lastIncludedIndex
+		}
+
+		log.Printf("[%s] Restored %d keys from snapshot", n.id, len(kvState))
 	}
 
 	log.Printf("[%s] Restored from storage: term=%d, votedFor=%s, log entries=%d", n.id, n.currentTerm, n.votedFor, len(n.log))
 
-	// Get last log index
-	lastLogIndex := n.getLastLogIndex()
-
 	// Replay log entries after snapshot
-	if n.lastApplied < lastLogIndex {
-		log.Printf("[%s] Replaying %d log entries", n.id, lastLogIndex-n.lastApplied)
+	if len(n.log) > 0 {
+		log.Printf("[%s] Replaying %d log entries after snapshot", n.id, len(n.log))
 
-		for i := n.lastApplied; i < lastLogIndex; i++ {
-			entry := n.log[i]
-			if err := n.kvStore.Apply(entry.Command); err != nil {
-				log.Printf("[%s] Failed to apply entry %d: %v", n.id, entry.Index, err)
+		for _, entry := range n.log {
+			// Validation: entry index should be after snapshot
+			if n.storage.HasSnapshot() {
+				snapIndex, _, _, _ := n.storage.LoadSnapshot()
+				if entry.Index <= snapIndex {
+					log.Printf("[%s] WARN: Entry %d is before/at snapshot %d, skipping", n.id, entry.Index, snapIndex)
+					continue
+				}
 			}
-			n.lastApplied = entry.Index
+
+			// Only apply entries after lastApplied
+			if entry.Index > n.lastApplied {
+				if err := n.kvStore.Apply(entry.Command); err != nil {
+					log.Printf("[%s] Failed to apply entry %d: %v", n.id, entry.Index, err)
+				}
+				n.lastApplied = entry.Index
+				log.Printf("[%s] Replayed entry index=%d", n.id, entry.Index)
+			}
 		}
 	}
-
+	log.Printf("[%s] Replay complete: lastApplied=%d", n.id, n.lastApplied)
 	return nil
 }
 
@@ -309,9 +325,16 @@ func (n *Node) replicateToPeer(peerID string) {
 		// Check if prevLogIndex is in snapshot
 		if n.storage.HasSnapshot() {
 			snapIndex, snapTerm, _, _ := n.storage.LoadSnapshot()
-			if prevLogIndex <= snapIndex {
+			if prevLogIndex == snapIndex {
 				// prevLogIndex is in snapshot, use snapshot's term
 				prevLogTerm = snapTerm
+				prevLogIndex = snapIndex
+			} else if prevLogIndex < snapIndex {
+				// Peer is too far behind, should have sent snapshot
+				log.Printf("[%s] ERROR: prevLogIndex %d is before snapshot %d", n.id, prevLogIndex, snapIndex)
+				n.mu.Unlock()
+				n.sendSnapshot(peerID)
+				return
 			}
 		}
 
@@ -489,36 +512,61 @@ func (n *Node) updateCommitIndex() {
 
 // applyEntries applies committed entries to state machine
 func (n *Node) applyEntries() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	for {
+		n.mu.Lock()
 
-	for n.lastApplied < n.commitIndex {
-		n.lastApplied++
+		// Check if there's work to do
+		if n.lastApplied >= n.commitIndex {
+			n.mu.Unlock()
+			return
+		}
+
+		nextIndex := n.lastApplied + 1
 
 		// Find entry by Index
-
 		var entry *pb.LogEntry
 		for _, e := range n.log {
-			if e.Index == n.lastApplied {
+			if e.Index == nextIndex {
 				entry = e
 				break
 			}
 		}
 
 		if entry == nil {
-			log.Printf("[%s] ERROR: Entry at index %d not found in log", n.id, n.lastApplied)
-			continue
+			// Entry not in log - check if it's in snapshot
+			if n.storage.HasSnapshot() {
+				snapIndex, _, _, _ := n.storage.LoadSnapshot()
+				if nextIndex <= snapIndex {
+					// Entry is in snapshot, already applied
+					log.Printf("[%s] Entry %d is in snapshot (snapIndex=%d), skipping", n.id, nextIndex, snapIndex)
+					n.lastApplied = nextIndex
+					n.mu.Unlock()
+					continue
+				}
+			}
+			// Entry not found and not in snapshot - this is a bug!
+			log.Printf("[%s] CRITICAL: Entry at index %d not found (lastApplied=%d, commitIndex=%d, log.len=%d)", n.id, nextIndex, n.lastApplied, n.commitIndex, len(n.log))
+			n.mu.Unlock()
+			return
 		}
 
-		log.Printf("[%s] Applying entry index=%d term=%d", n.id, entry.Index, entry.Term)
+		// Found entry, copy data
+		entryIndex := entry.Index
+		entryCommand := make([]byte, len(entry.Command))
+		copy(entryCommand, entry.Command)
+
+		n.mu.Unlock()
 
 		if err := n.kvStore.Apply(entry.Command); err != nil {
 			log.Printf("[%s] Failed to apply entry %d: %v", n.id, entry.Index, err)
 		}
-	}
 
-	// Trigger snapshot check after applying entries
-	go n.maybeSnapshot()
+		n.mu.Lock()
+		if entryIndex > n.lastApplied {
+			n.lastApplied = entry.Index
+		}
+		n.mu.Unlock()
+	}
 }
 
 // Isleader checks if this node is the leader
@@ -835,12 +883,12 @@ func (n *Node) sendHeartbeats() {
 	for {
 		select {
 		case <-n.heartbeatTimer.C:
-			n.mu.Lock()
-			if n.state != Leader { // status check
-				n.mu.Unlock()
-				return
-			}
-			n.mu.Unlock()
+			// n.mu.Lock()
+			// if n.state != Leader { // status check
+			// 	n.mu.Unlock()
+			// 	return
+			// }
+			// n.mu.Unlock()
 
 			// Replicate to all peers (includes heartbeat + log entries if any)
 			n.replicateToAll()
