@@ -59,7 +59,7 @@ func (s *KVServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse
 // Set handles write requests (must be on leader)
 func (s *KVServer) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse, error) {
 	resp := &pb.SetResponse{
-		Succcess: false,
+		Success: false,
 	}
 
 	// Check if we're the leader
@@ -75,7 +75,7 @@ func (s *KVServer) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse
 
 	// Create command
 	cmd := map[string]any{
-		"op":    "set",
+		"op":    "SET",
 		"key":   req.Key,
 		"value": req.Value,
 	}
@@ -92,12 +92,12 @@ func (s *KVServer) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse
 		if !s.node.IsLeader() {
 			resp.IsLeader = false
 			_, resp.LeaderId, resp.LeaderAddress = s.node.GetLeaderInfo()
-			resp.Succcess = false
+			resp.Success = false
 			return resp, nil
 		}
 		return nil, fmt.Errorf("failed to propose: %v", err)
 	}
-	resp.Succcess = true
+	resp.Success = true
 	resp.RaftIndex = index
 
 	return resp, nil
@@ -120,7 +120,7 @@ func (s *KVServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Delet
 	}
 
 	cmd := map[string]any{
-		"op":  "delete",
+		"op":  "DELETE",
 		"key": req.Key,
 	}
 

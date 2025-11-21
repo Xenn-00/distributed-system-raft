@@ -212,8 +212,8 @@ func (x *SetRequest) GetValue() string {
 }
 
 type SetResponse struct {
-	state    protoimpl.MessageState `protogen:"open.v1"`
-	Succcess bool                   `protobuf:"varint,1,opt,name=succcess,proto3" json:"succcess,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Success bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
 	// Redirect info
 	IsLeader      bool   `protobuf:"varint,2,opt,name=is_leader,json=isLeader,proto3" json:"is_leader,omitempty"`
 	LeaderId      string `protobuf:"bytes,3,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
@@ -254,9 +254,9 @@ func (*SetResponse) Descriptor() ([]byte, []int) {
 	return file_proto_kv_proto_rawDescGZIP(), []int{3}
 }
 
-func (x *SetResponse) GetSucccess() bool {
+func (x *SetResponse) GetSuccess() bool {
 	if x != nil {
-		return x.Succcess
+		return x.Success
 	}
 	return false
 }
@@ -549,9 +549,9 @@ const file_proto_kv_proto_rawDesc = "" +
 	"\n" +
 	"SetRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value\"\xa9\x01\n" +
-	"\vSetResponse\x12\x1a\n" +
-	"\bsucccess\x18\x01 \x01(\bR\bsucccess\x12\x1b\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value\"\xa7\x01\n" +
+	"\vSetResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x1b\n" +
 	"\tis_leader\x18\x02 \x01(\bR\bisLeader\x12\x1b\n" +
 	"\tleader_id\x18\x03 \x01(\tR\bleaderId\x12%\n" +
 	"\x0eleader_address\x18\x04 \x01(\tR\rleaderAddress\x12\x1d\n" +

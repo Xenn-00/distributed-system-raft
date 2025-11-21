@@ -1,6 +1,9 @@
 package raft
 
 import (
+	"log"
+	"net"
+	"strconv"
 	"strings"
 
 	"github.com/Xenn-00/distributed-kv-store/kv"
@@ -55,6 +58,28 @@ func (n *Node) GetKVStore() *kv.KVStore {
 	return n.kvStore
 }
 
+// getKVAddress converts Raft internal address to KV API address
+// Example: "localhost:5001" -> "localhost:6001"
+func (n *Node) getKVAddress(raftAddr string) string {
+	host, port, err := net.SplitHostPort(raftAddr)
+	if err != nil {
+		log.Printf("[%s] Failed to parse address %s: %v", n.id, raftAddr, err)
+		return raftAddr
+	}
+
+	portNum, err := strconv.Atoi(port)
+	if err != nil {
+		log.Printf("[%s] Failed to parse port %s: %v", n.id, port, err)
+		return raftAddr
+	}
+
+	// Convention: KV port = Raft port + 1000
+	kvPort := portNum + 1000
+	kvAddr := net.JoinHostPort(host, strconv.Itoa(kvPort))
+	log.Printf("[%s] Mapped Raft address %s -> KV address %s", n.id, raftAddr, kvAddr)
+	return kvAddr
+}
+
 // isLogUpToDate checks if candidate's log is at least as up-to-date as ours
 // If the logs have last entries with different terms, then the log with the later term is
 // more up-to-date. If the logs end with the same term, then whichever log is longer is
@@ -107,15 +132,8 @@ func (n *Node) GetLeaderInfo() (isLeader bool, leaderID string, leaderAddress st
 	leaderID = n.leaderID
 
 	if leaderID != "" && leaderID != n.id {
-		leaderAddress = n.peers[leaderID]
-	} else if isLeader {
-		// We are the leader, return our address
-		for id, addr := range n.peers {
-			if id == n.id {
-				leaderAddress = addr
-				break
-			}
-		}
+		raftAddr := n.peers[leaderID]
+		leaderAddress = n.getKVAddress(raftAddr)
 	}
 
 	return

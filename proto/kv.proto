@@ -34,7 +34,7 @@ message SetRequest {
 }
 
 message SetResponse {
-    bool succcess = 1;
+    bool success = 1;
     
     // Redirect info
     bool is_leader = 2;
