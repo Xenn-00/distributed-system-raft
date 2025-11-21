@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package kv;
+option go_package = "github.com/Xenn-00/distributed-kv-store/proto/kvpb";
+
+service KV {
+    rpc Get (GetRequest) returns (GetResponse);
+    rpc Set (SetRequest) returns (SetResponse);
+    rpc Delete (DeleteRequest) returns (DeleteResponse);
+    rpc List (ListRequest) returns (ListResponse);
+}
+
+message GetRequest {
+    string key = 1;
+    bool linearizable = 2; // true = leader only, false = any node (stale ok)
+}
+
+message GetResponse {
+    string value = 1;
+    bool found = 2;
+
+    // Redirect info if not leader
+    bool is_leader = 3;
+    string leader_id = 4;
+    string leader_address = 5;
+
+    // Metadata
+    uint64 raft_index = 6; // index when this was committed
+}
+
+message SetRequest {
+    string key = 1;
+    string value = 2; 
+}
+
+message SetResponse {
+    bool succcess = 1;
+    
+    // Redirect info
+    bool is_leader = 2;
+    string leader_id = 3;
+    string leader_address = 4;
+
+    // Metadata
+    uint64 raft_index = 5;
+}
+
+message DeleteRequest {
+    string key = 1;
+}
+
+message DeleteResponse {
+    bool success = 1;
+    bool is_leader = 2;
+    string leader_id = 3;
+    string leader_address = 4;
+    uint64 raft_index = 5;
+}
+
+message ListRequest {
+    string prefix = 1; // optional: filter by prefix
+    uint32 limit = 2; // optional: limit results
+}
+
+message ListResponse {
+    map<string, string> entries = 1;
+    bool is_leader = 2;
+    string leader_id = 3;
+    string leader_address = 4;
+}
+

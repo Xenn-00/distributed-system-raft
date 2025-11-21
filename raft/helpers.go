@@ -1,6 +1,10 @@
 package raft
 
-import "github.com/Xenn-00/distributed-kv-store/kv"
+import (
+	"strings"
+
+	"github.com/Xenn-00/distributed-kv-store/kv"
+)
 
 func (n *Node) HasSnapshot() bool {
 	return n.storage.HasSnapshot()
@@ -80,6 +84,75 @@ func (n *Node) GetLeaderID() string {
 	}
 
 	return n.leaderID // Return tracked leader
+}
+
+// GetValue reads from KV store
+func (n *Node) GetValue(key string) (string, bool) {
+	return n.kvStore.Get(key)
+}
+
+// GetCommitIndex returns current commit index
+func (n *Node) GetCommitIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.commitIndex
+}
+
+// GetLeaderInfo returns current leader information
+func (n *Node) GetLeaderInfo() (isLeader bool, leaderID string, leaderAddress string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	isLeader = (n.state == Leader)
+	leaderID = n.leaderID
+
+	if leaderID != "" && leaderID != n.id {
+		leaderAddress = n.peers[leaderID]
+	} else if isLeader {
+		// We are the leader, return our address
+		for id, addr := range n.peers {
+			if id == n.id {
+				leaderAddress = addr
+				break
+			}
+		}
+	}
+
+	return
+}
+
+// ListEntries returns all entries (or filtered by prefix)
+func (n *Node) ListEntries(prefix string, limit int) map[string]string {
+	all := n.kvStore.GetAll()
+
+	if prefix == "" && limit == 0 {
+		return all
+	}
+
+	result := make(map[string]string)
+	count := 0
+
+	for k, v := range all {
+		if prefix != "" && !strings.HasPrefix(k, prefix) {
+			continue
+		}
+
+		result[k] = v
+		count++
+
+		if limit > 0 && count >= limit {
+			break
+		}
+	}
+
+	return result
+}
+
+// Isleader checks if this node is the leader
+func (n *Node) IsLeader() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.state == Leader
 }
 
 // GetLeaderAddress return address leader (perfect for redirect)

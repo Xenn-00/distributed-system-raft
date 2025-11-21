@@ -194,43 +194,116 @@ func (n *Node) restoreFromStorage() error {
 }
 
 // Propose: propose a new command to the cluster (only leader)
-func (n *Node) Propose(cmd kv.Command) error {
+func (n *Node) Propose(ctx context.Context, command []byte) (uint64, error) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 
 	// Only leader can propose
 	if n.state != Leader {
-		return fmt.Errorf("not leader")
-	}
-
-	// Encode command
-	cmdBytes, err := json.Marshal(cmd)
-	if err != nil {
-		return err
+		return 0, fmt.Errorf("not leader")
 	}
 
 	// Get last log index (handles snapshot!)
 	lastLogIndex := n.getLastLogIndex()
+	index := lastLogIndex + 1
 	// Create log entry
 	entry := &pb.LogEntry{
 		Term:    n.currentTerm,
-		Index:   lastLogIndex + 1,
-		Command: cmdBytes,
+		Index:   index,
+		Command: command,
 	}
 
 	// Persist to WAL FIRST
 	if err := n.storage.AppendLog(entry); err != nil {
-		return fmt.Errorf("failed to persiste log: %v", err)
+		return 0, fmt.Errorf("failed to persiste log: %v", err)
 	}
 
 	// Then append to memory
 	n.log = append(n.log, entry)
-	log.Printf("[%s] Proposed entry index=%d term=%d cmd=%+v", n.id, entry.Index, entry.Term, cmd)
+	log.Printf("[%s] Proposed entry index=%d term=%d", n.id, entry.Index, entry.Term)
+
+	// Unlock before waiting
+	n.mu.Unlock()
 
 	// Trigger replication (will happend on next heartbeat or immediate)
 	go n.replicateToAll()
 
-	return nil
+	// Wait for commit before returning
+	if err := n.waitForCommit(ctx, index); err != nil {
+		return 0, fmt.Errorf("failed to commit: %v", err)
+	}
+
+	// Check if applied after commit
+	n.mu.Lock()
+	applied := n.lastApplied >= index
+	n.mu.Unlock()
+
+	log.Printf("[%s] Entry %d committed successfully (lastApplieed=%d, applied=%v)", n.id, index, n.lastApplied, applied)
+	return index, nil
+}
+
+// waitForCommit waits until the given index is committed
+func (n *Node) waitForCommit(ctx context.Context, index uint64) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	timeout := time.After(5 * time.Second)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout:
+			return fmt.Errorf("timeout waiting for commit")
+		case <-ticker.C:
+			n.mu.Lock()
+			committed := n.commitIndex >= index
+			stillLeader := n.state == Leader
+			n.mu.Unlock()
+
+			if !stillLeader {
+				return fmt.Errorf("no longer leader")
+			}
+
+			if committed {
+				return nil
+			}
+		}
+	}
+}
+
+// WaitForCommit ensures current commitIndex has been applied (for linearizable reads)
+func (n *Node) WaitForCommit(ctx context.Context) error {
+	if !n.IsLeader() {
+		return fmt.Errorf("not leader")
+	}
+
+	// Record current commitIndex
+	n.mu.Lock()
+	readIndex := n.commitIndex
+	n.mu.Unlock()
+
+	// Wait for lastApplied to catch up
+	return n.waitForApply(ctx, readIndex)
+}
+
+func (n *Node) waitForApply(ctx context.Context, index uint64) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			n.mu.Lock()
+			applied := n.lastApplied >= index
+			n.mu.Unlock()
+
+			if applied {
+				return nil
+			}
+		}
+	}
 }
 
 // replicateToAll sends AppendEntries to all followers
@@ -512,15 +585,10 @@ func (n *Node) updateCommitIndex() {
 
 // applyEntries applies committed entries to state machine
 func (n *Node) applyEntries() {
-	for {
-		n.mu.Lock()
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-		// Check if there's work to do
-		if n.lastApplied >= n.commitIndex {
-			n.mu.Unlock()
-			return
-		}
-
+	for n.lastApplied < n.commitIndex {
 		nextIndex := n.lastApplied + 1
 
 		// Find entry by Index
@@ -540,40 +608,39 @@ func (n *Node) applyEntries() {
 					// Entry is in snapshot, already applied
 					log.Printf("[%s] Entry %d is in snapshot (snapIndex=%d), skipping", n.id, nextIndex, snapIndex)
 					n.lastApplied = nextIndex
-					n.mu.Unlock()
 					continue
 				}
+
+				// Entry not found and not in snapshot
+				log.Printf("[%s] CRITICAL: Entry at index %d not found (lastApplied=%d, commitIndex=%d, log.len=%d)", n.id, nextIndex, n.lastApplied, n.commitIndex, len(n.log))
+
+				// Debug: Print current log
+				log.Printf("[%s] Current log entries:", n.id)
+				for i, e := range n.log {
+					log.Printf("[%s]   log[%d]: index=%d, term=%d", n.id, i, e.Index, e.Term)
+				}
+				break
 			}
-			// Entry not found and not in snapshot - this is a bug!
-			log.Printf("[%s] CRITICAL: Entry at index %d not found (lastApplied=%d, commitIndex=%d, log.len=%d)", n.id, nextIndex, n.lastApplied, n.commitIndex, len(n.log))
-			n.mu.Unlock()
-			return
 		}
 
-		// Found entry, copy data
+		// Copy command data to avoid holding lock during Apply
 		entryIndex := entry.Index
 		entryCommand := make([]byte, len(entry.Command))
 		copy(entryCommand, entry.Command)
 
+		// Apply without holding lock (kvStore might be slow)
 		n.mu.Unlock()
-
-		if err := n.kvStore.Apply(entry.Command); err != nil {
-			log.Printf("[%s] Failed to apply entry %d: %v", n.id, entry.Index, err)
-		}
-
+		err := n.kvStore.Apply(entryCommand)
 		n.mu.Lock()
-		if entryIndex > n.lastApplied {
-			n.lastApplied = entry.Index
+		if err != nil {
+			log.Printf("[%s] Failed to apply entry %d: %v", n.id, entryIndex, err)
+			break // stop on error
 		}
-		n.mu.Unlock()
-	}
-}
 
-// Isleader checks if this node is the leader
-func (n *Node) IsLeader() bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.state == Leader
+		// Update lastApplied
+		n.lastApplied = entryIndex
+		log.Printf("[%s] Applied entry index=%d (lastApplied=%d, commitIndex=%d)", n.id, entryIndex, n.lastApplied, n.commitIndex)
+	}
 }
 
 // Lazy get client with retry
