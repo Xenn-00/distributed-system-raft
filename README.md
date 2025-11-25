@@ -1,4 +1,4 @@
-# Distrubuted Key-Value Store with Raft Consensus
+# Distributed Key-Value Store with Raft Consensus
 
 <div>
   <img src="https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go"/>
