@@ -9,7 +9,7 @@ datasources:
     basicAuth: true
     basicAuthUser: admin
     secureJsonData:
-      basicAuthPassword: admin123
+      basicAuthPassword: admin
     jsonData:
       httpMode: GET
     editable: true

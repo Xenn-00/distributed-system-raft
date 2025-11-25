@@ -18,7 +18,8 @@ import (
 )
 
 type Node struct {
-	mu sync.Mutex
+	mu      sync.Mutex
+	applyMu sync.Mutex
 
 	// Persistent state
 	currentTerm uint64
@@ -426,7 +427,7 @@ func (n *Node) replicateToPeer(peerID string) {
 			// This shouldn't happen if snapshot logic is correct
 			// But let's be defensive - send empty heartbeat
 			log.Printf("[%s] ERROR: Cannot find prevLogTerm for index %d", n.id, prevLogIndex)
-			n.mu.Unlock()
+			// n.mu.Unlock()
 			// Don't return - let it fail gracefully on follower side
 		}
 	}
@@ -443,11 +444,12 @@ func (n *Node) replicateToPeer(peerID string) {
 		n.mu.Lock()
 		n.replicationFailures[peerID]++
 		n.lastFailureTime[peerID] = time.Now()
+		failureCount := n.replicationFailures[peerID] // Read while holding lock
 		n.mu.Unlock()
 
 		// Only log first few failures
-		if n.replicationFailures[peerID] <= 3 {
-			log.Printf("[%s] Failed to get client for %s: %v (failure %d)", n.id, peerID, err, n.replicationFailures[peerID])
+		if failureCount <= 3 {
+			log.Printf("[%s] Failed to get client for %s: %v (failure %d)", n.id, peerID, err, failureCount)
 		}
 		return
 	}
@@ -471,26 +473,28 @@ func (n *Node) replicateToPeer(peerID string) {
 		n.mu.Lock()
 		n.replicationFailures[peerID]++
 		n.lastFailureTime[peerID] = time.Now()
+		failureCount := n.replicationFailures[peerID] // Read while holding lock
+		shouldLog := len(entries) > 0 && failureCount <= 3
 		n.mu.Unlock()
 
 		// Only log first few failures
-		if len(entries) > 0 && n.replicationFailures[peerID] <= 3 {
-			log.Printf("[%s] Failed to replicate to %s: %v (failure %d)", n.id, peerID, err, n.replicationFailures[peerID])
+		if shouldLog {
+			log.Printf("[%s] Failed to replicate to %s: %v (failure %d)", n.id, peerID, err, failureCount)
 		}
 		return
 	}
 
-	// Log successful heartbeat occasionally (not every time - too noisy)
-	if len(entries) == 0 {
-		// Heartbeat success (log every 10th heartbeat to reduce noise)
-		// Or just don't log at all
-	} else {
-		n.mu.Lock()
-		n.replicationFailures[peerID] = 0
-		delete(n.lastFailureTime, peerID)
-		n.mu.Unlock()
-		log.Printf("[%s] Replicated %d entries to %s", n.id, len(entries), peerID)
-	}
+	// // Log successful heartbeat occasionally (not every time - too noisy)
+	// if len(entries) == 0 {
+	// 	// Heartbeat success (log every 10th heartbeat to reduce noise)
+	// 	// Or just don't log at all
+	// } else {
+	// 	n.mu.Lock()
+	// 	n.replicationFailures[peerID] = 0
+	// 	delete(n.lastFailureTime, peerID)
+	// 	n.mu.Unlock()
+	// 	log.Printf("[%s] Replicated %d entries to %s", n.id, len(entries), peerID)
+	// }
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -522,6 +526,9 @@ func (n *Node) replicateToPeer(peerID string) {
 
 	if resp.Success {
 		// Update matchIndex and nextIndex
+		n.replicationFailures[peerID] = 0
+		delete(n.lastFailureTime, peerID)
+
 		if len(entries) > 0 {
 			lastIdx := entries[len(entries)-1].Index
 			n.matchIndex[peerID] = lastIdx
@@ -585,10 +592,19 @@ func (n *Node) updateCommitIndex() {
 
 // applyEntries applies committed entries to state machine
 func (n *Node) applyEntries() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	// Only one goroutine can apply at a time
+	n.applyMu.Lock()
+	defer n.applyMu.Unlock()
+	for {
+		// Phase 1: Get next entry to apply (locked)
+		n.mu.Lock()
 
-	for n.lastApplied < n.commitIndex {
+		// check if there's work to do
+		if n.lastApplied >= n.commitIndex {
+			n.mu.Unlock()
+			return
+		}
+
 		nextIndex := n.lastApplied + 1
 
 		// Find entry by Index
@@ -619,7 +635,8 @@ func (n *Node) applyEntries() {
 				for i, e := range n.log {
 					log.Printf("[%s]   log[%d]: index=%d, term=%d", n.id, i, e.Index, e.Term)
 				}
-				break
+				n.mu.Unlock()
+				return // Stop applying
 			}
 		}
 
@@ -628,18 +645,20 @@ func (n *Node) applyEntries() {
 		entryCommand := make([]byte, len(entry.Command))
 		copy(entryCommand, entry.Command)
 
-		// Apply without holding lock (kvStore might be slow)
+		// Phase 2: Apply without holding lock (kvStore might be slow)
 		n.mu.Unlock()
+
 		err := n.kvStore.Apply(entryCommand)
-		n.mu.Lock()
 		if err != nil {
 			log.Printf("[%s] Failed to apply entry %d: %v", n.id, entryIndex, err)
 			break // stop on error
 		}
 
 		// Update lastApplied
+		n.mu.Lock()
 		n.lastApplied = entryIndex
 		log.Printf("[%s] Applied entry index=%d (lastApplied=%d, commitIndex=%d)", n.id, entryIndex, n.lastApplied, n.commitIndex)
+		n.mu.Unlock()
 	}
 }
 

@@ -13,9 +13,13 @@ export const options = {
   stages: [
     { duration: "30s", target: 200 }, // Warm up
     { duration: "1m", target: 200 }, // Ramp up
-    { duration: "30s", target: 500 }, // Steady
-    { duration: "1m", target: 500 }, // Steady
-    { duration: "30s", target: 0 }, // Ramp down
+    { duration: "30s", target: 500 }, // Ramp up
+    { duration: "1m", target: 750 }, // Steady
+    { duration: "30s", target: 500 }, // Ramp down
+    { duration: "45s", target: 350 }, // Ramp down
+    { duration: "30s", target: 175 }, // Ramp down
+    { duration: "30s", target: 70 }, // Ramp down
+    { duration: "15s", target: 0 }, // Ramp down
   ],
   thresholds: {
     success_rate: ["rate>0.90"], // 90% success (more lenient for testing)
