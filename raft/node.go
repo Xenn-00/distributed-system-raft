@@ -63,6 +63,8 @@ type Node struct {
 	commitNotifyCh chan struct{} // Broadcast when commitIndex advances
 	applyNotifyCh  chan struct{} // Broadcast when lastApplied advances
 
+	applyTrigerCh chan struct{} // Trigger immediate apply
+
 	// // Priority heartbeart channel
 	// heartbeatCh chan struct{} // Trigger immediate heartbeat
 
@@ -100,10 +102,11 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 		storage:           stor,
 		lastSnapshotTime:  time.Now(),
 		lastSnapshotIndex: 0,
-		commitNotifyCh:    make(chan struct{}, 1), // Buffer 1 to prevent blocking
+		commitNotifyCh:    make(chan struct{}, 128), // Buffer 128 to prevent blocking
 		applyNotifyCh:     make(chan struct{}, 1),
+		applyTrigerCh:     make(chan struct{}, 1),
 		// heartbeatCh:         make(chan struct{}, 1),
-		replicationQueue:    make(chan string, 100), // Buffer 100 tasks
+		replicationQueue:    make(chan string, 128), // Buffer 128 tasks
 		replicationStop:     make(chan struct{}),
 		replicationFailures: make(map[string]int),
 		lastFailureTime:     make(map[string]time.Time),
@@ -211,6 +214,7 @@ func (n *Node) Propose(ctx context.Context, command []byte) (uint64, error) {
 
 	// Only leader can propose
 	if n.state != Leader {
+		n.mu.Unlock()
 		return 0, fmt.Errorf("not leader")
 	}
 
@@ -248,6 +252,7 @@ func (n *Node) Propose(ctx context.Context, command []byte) (uint64, error) {
 
 	// Wait for commit before returning
 	if err := n.waitForCommit(ctx, index); err != nil {
+		n.mu.Unlock()
 		return 0, fmt.Errorf("failed to commit: %v", err)
 	}
 
@@ -288,6 +293,16 @@ func (n *Node) waitForCommit(ctx context.Context, index uint64) error {
 		case <-timeout:
 			return fmt.Errorf("timeout waiting for commit")
 		case <-n.commitNotifyCh:
+			// Drain any queue notifications
+		drainLoop:
+			for {
+				select {
+				case <-n.commitNotifyCh:
+					// keep draining
+				default:
+					break drainLoop
+				}
+			}
 			// Got notification, check if our index is committed
 			n.mu.Lock()
 			committed := n.commitIndex >= index
@@ -358,10 +373,17 @@ func (n *Node) replicateToAll() {
 		return
 	}
 
+	peers := make([]string, 0, len(n.peers))
 	for peerID := range n.peers {
 		if peerID == n.id {
 			continue
 		}
+		peers = append(peers, peerID)
+	}
+
+	n.mu.Unlock()
+
+	for _, peerID := range peers {
 		// Non-blocking enqueue
 		select {
 		case n.replicationQueue <- peerID:
@@ -373,7 +395,6 @@ func (n *Node) replicateToAll() {
 		// go n.replicateToPeer(peerID)
 	}
 
-	n.mu.Unlock()
 }
 
 // replicateToPeer sends AppendEntries to a specific peer
@@ -637,10 +658,19 @@ func (n *Node) updateCommitIndex() {
 				log.Printf("[%s] Advancing commitIndex from %d to %d (majority confirmed: %d/%d)", n.id, oldCommit, N, count, len(n.peers))
 			}
 			// Apply commited entries
-			go n.applyEntries()
+			select {
+			case n.applyTrigerCh <- struct{}{}:
+			default:
+			}
 		} else {
 			break // Can't commit higher indices yet
 		}
+	}
+}
+
+func (n *Node) applyLoop() {
+	for range n.applyTrigerCh {
+		n.applyEntries()
 	}
 }
 
@@ -678,6 +708,7 @@ func (n *Node) applyEntries() {
 					// Entry is in snapshot, already applied
 					log.Printf("[%s] Entry %d is in snapshot (snapIndex=%d), skipping", n.id, nextIndex, snapIndex)
 					n.lastApplied = nextIndex
+					n.mu.Unlock()
 					continue
 				}
 
@@ -783,21 +814,21 @@ func (n *Node) Start() {
 
 	// Start replication workers
 	n.startReplicationWorkers()
-
 	// Start periodic snapshot check
 	go n.periodicSnapshotCheck()
 	go n.reportFailures()
 	go n.run()
+	go n.applyLoop()
 }
 
 func (n *Node) startReplicationWorkers() {
-	// Start 10 workers (5 per peer for 2 peers)
+	// Start 25 workers (12 per peer for 2 peers)
 	// This limits concurrent replication goroutines
-	numWorkers := 10
+	numWorkers := 25
 
 	log.Printf("[%s] Starting %d replication workers", n.id, numWorkers)
 
-	for i := range numWorkers {
+	for i := 0; i < numWorkers; i++ {
 		go n.replicationWorkers(i)
 	}
 }
@@ -984,7 +1015,7 @@ func (n *Node) startElection() {
 			var resp *pb.RequestVoteResponse
 			var lastErr error
 			maxAttempts := 2
-			for attempt := range maxAttempts {
+			for attempt := 0; attempt < maxAttempts; attempt++ {
 				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 
 				req := &pb.RequestVoteRequest{
