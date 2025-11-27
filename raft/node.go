@@ -63,8 +63,8 @@ type Node struct {
 	commitNotifyCh chan struct{} // Broadcast when commitIndex advances
 	applyNotifyCh  chan struct{} // Broadcast when lastApplied advances
 
-	// Priority heartbeart channel
-	heartbeatCh chan struct{} // Trigger immediate heartbeat
+	// // Priority heartbeart channel
+	// heartbeatCh chan struct{} // Trigger immediate heartbeat
 
 	// Worker pool for bounded replcation
 	replicationQueue chan string   // peerID to replicate to
@@ -83,26 +83,26 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 	}
 
 	node := &Node{
-		id:                  id,
-		state:               Follower,
-		peers:               peers,
-		currentTerm:         0,
-		votedFor:            "",
-		log:                 make([]*pb.LogEntry, 0),
-		commitIndex:         0,
-		lastApplied:         0,
-		leaderID:            "",
-		nextIndex:           make(map[string]uint64),
-		matchIndex:          make(map[string]uint64),
-		shutdownCh:          make(chan struct{}),
-		clients:             make(map[string]pb.RaftClient),
-		kvStore:             kv.NewKVStore(),
-		storage:             stor,
-		lastSnapshotTime:    time.Now(),
-		lastSnapshotIndex:   0,
-		commitNotifyCh:      make(chan struct{}, 1), // Buffer 1 to prevent blocking
-		applyNotifyCh:       make(chan struct{}, 1),
-		heartbeatCh:         make(chan struct{}, 1),
+		id:                id,
+		state:             Follower,
+		peers:             peers,
+		currentTerm:       0,
+		votedFor:          "",
+		log:               make([]*pb.LogEntry, 0),
+		commitIndex:       0,
+		lastApplied:       0,
+		leaderID:          "",
+		nextIndex:         make(map[string]uint64),
+		matchIndex:        make(map[string]uint64),
+		shutdownCh:        make(chan struct{}),
+		clients:           make(map[string]pb.RaftClient),
+		kvStore:           kv.NewKVStore(),
+		storage:           stor,
+		lastSnapshotTime:  time.Now(),
+		lastSnapshotIndex: 0,
+		commitNotifyCh:    make(chan struct{}, 1), // Buffer 1 to prevent blocking
+		applyNotifyCh:     make(chan struct{}, 1),
+		// heartbeatCh:         make(chan struct{}, 1),
 		replicationQueue:    make(chan string, 100), // Buffer 100 tasks
 		replicationStop:     make(chan struct{}),
 		replicationFailures: make(map[string]int),
@@ -224,11 +224,14 @@ func (n *Node) Propose(ctx context.Context, command []byte) (uint64, error) {
 		Command: command,
 	}
 
+	n.mu.Unlock() // release before disk I/O
+
 	// Persist to WAL FIRST
 	if err := n.storage.AppendLog(entry); err != nil {
 		return 0, fmt.Errorf("failed to persiste log: %v", err)
 	}
 
+	n.mu.Lock()
 	// Then append to memory
 	n.log = append(n.log, entry)
 
@@ -808,7 +811,7 @@ func (n *Node) replicationWorkers(workerID int) {
 			n.replicateToPeer(peerID)
 		case <-n.replicationStop:
 			log.Printf("[%s] Replication worker %d stopping", n.id, workerID)
-			grpc.WithReturnConnectionError()
+			return
 		case <-n.shutdownCh:
 			return
 		}
@@ -1059,55 +1062,35 @@ func (n *Node) startElection() {
 }
 
 func (n *Node) sendHeartbeats() {
-	ticker := time.NewTicker(HeartbeatInterval)
-	defer ticker.Stop()
-
 	for {
 		select {
-		case <-ticker.C:
-			// n.mu.Lock()
-			// if n.state != Leader { // status check
-			// 	n.mu.Unlock()
-			// 	return
-			// }
-			// n.mu.Unlock()
-
-			// Replicate to all peers (includes heartbeat + log entries if any)
-			// n.replicateToAll()
-			n.sendHeartbeatImmediate()
-		case <-n.heartbeatCh:
-			// immediate heartbeat (bypass queue)
-			n.sendHeartbeatImmediate()
+		case <-n.heartbeatTimer.C:
+			n.replicateToAll()
 		case <-n.shutdownCh:
-			log.Printf("[%s] Heartbeat goroutine shutting down", n.id)
 			return
 		}
 	}
 }
 
-func (n *Node) sendHeartbeatImmediate() {
-	// Send empty AppendEntries as heartbeat
-	// Faster than replicateToAll since we don't need to prepare entries
-	for peerID := range n.peers {
-		go func(peerID string) {
-			n.mu.Lock()
-			req := &pb.AppendEntriesRequest{
-				Term:         n.currentTerm,
-				LeaderId:     n.id,
-				LeaderCommit: n.commitIndex,
-				Entries:      nil, // Empty heartbeat
-			}
-			n.mu.Unlock()
+// func (n *Node) sendHeartbeatImmediate() {
+// 	// Send empty AppendEntries as heartbeat
+// 	// Faster than replicateToAll since we don't need to prepare entries
+// 	for peerID := range n.peers {
+// 		if peerID == n.id {
+// 			continue
+// 		}
 
-			client, _ := n.getClient(peerID)
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			defer cancel()
-			client.AppendEntries(ctx, req)
-		}(peerID)
-	}
-}
+// 		select {
+// 		case n.replicationQueue <- peerID:
+// 		default:
+// 		}
+// 	}
+// }
 
 func (n *Node) Shutdown() {
+	// Stop worker pool
+	close(n.replicationStop)
+
 	close(n.shutdownCh)
 	if n.heartbeatTimer != nil {
 		n.heartbeatTimer.Stop()
