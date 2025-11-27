@@ -59,21 +59,21 @@ type Node struct {
 	lastSnapshotTime  time.Time
 	lastSnapshotIndex uint64
 
+	// Notification channels
+	commitNotifyCh chan struct{} // Broadcast when commitIndex advances
+	applyNotifyCh  chan struct{} // Broadcast when lastApplied advances
+
+	// Priority heartbeart channel
+	heartbeatCh chan struct{} // Trigger immediate heartbeat
+
+	// Worker pool for bounded replcation
+	replicationQueue chan string   // peerID to replicate to
+	replicationStop  chan struct{} // stop workers
+
 	// Rate limiting for failed replications
 	replicationFailures map[string]int       // peerID -> consecutive failures
 	lastFailureTime     map[string]time.Time // peerID -> last failure time
 }
-
-const (
-	// Snapshot ever N log entries
-	SnapshotThreshold = 10 // Set low for testing, production could use 10000+
-
-	// Time-based trigger
-	SnapshotInterval = 3 * time.Minute
-
-	// Minimum entries before time-based snapshot
-	MinEntriesForSnapshot = 5 // Don't snapshot if <5 entries
-)
 
 func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) {
 	// Open Storage
@@ -100,6 +100,11 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 		storage:             stor,
 		lastSnapshotTime:    time.Now(),
 		lastSnapshotIndex:   0,
+		commitNotifyCh:      make(chan struct{}, 1), // Buffer 1 to prevent blocking
+		applyNotifyCh:       make(chan struct{}, 1),
+		heartbeatCh:         make(chan struct{}, 1),
+		replicationQueue:    make(chan string, 100), // Buffer 100 tasks
+		replicationStop:     make(chan struct{}),
 		replicationFailures: make(map[string]int),
 		lastFailureTime:     make(map[string]time.Time),
 	}
@@ -168,7 +173,8 @@ func (n *Node) restoreFromStorage() error {
 
 	// Replay log entries after snapshot
 	if len(n.log) > 0 {
-		log.Printf("[%s] Replaying %d log entries after snapshot", n.id, len(n.log))
+		// Optimized: only log every 10th entry during replay
+		logCount := 0
 
 		for _, entry := range n.log {
 			// Validation: entry index should be after snapshot
@@ -186,7 +192,12 @@ func (n *Node) restoreFromStorage() error {
 					log.Printf("[%s] Failed to apply entry %d: %v", n.id, entry.Index, err)
 				}
 				n.lastApplied = entry.Index
-				log.Printf("[%s] Replayed entry index=%d", n.id, entry.Index)
+				logCount++
+
+				// Sample logging
+				if shouldLog(entry.Index, 10) {
+					log.Printf("[%s] Replayed entry index=%d", n.id, entry.Index)
+				}
 			}
 		}
 	}
@@ -220,7 +231,11 @@ func (n *Node) Propose(ctx context.Context, command []byte) (uint64, error) {
 
 	// Then append to memory
 	n.log = append(n.log, entry)
-	log.Printf("[%s] Proposed entry index=%d term=%d", n.id, entry.Index, entry.Term)
+
+	// Sample logging
+	if shouldLog(index, 10) {
+		log.Printf("[%s] Proposed entry index=%d term=%d", n.id, entry.Index, entry.Term)
+	}
 
 	// Unlock before waiting
 	n.mu.Unlock()
@@ -238,16 +253,30 @@ func (n *Node) Propose(ctx context.Context, command []byte) (uint64, error) {
 	applied := n.lastApplied >= index
 	n.mu.Unlock()
 
-	log.Printf("[%s] Entry %d committed successfully (lastApplieed=%d, applied=%v)", n.id, index, n.lastApplied, applied)
+	// Sample logging
+	if shouldLog(index, 10) {
+		log.Printf("[%s] Entry %d committed successfully (lastApplieed=%d, applied=%v)", n.id, index, n.lastApplied, applied)
+	}
 	return index, nil
 }
 
 // waitForCommit waits until the given index is committed
 func (n *Node) waitForCommit(ctx context.Context, index uint64) error {
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
+	// Check immediately first (optimization)
+	n.mu.Lock()
+	if n.commitIndex >= index {
+		n.mu.Unlock()
+		return nil
+	}
 
-	timeout := time.After(5 * time.Second)
+	stillLeader := n.state == Leader
+	n.mu.Unlock()
+
+	if !stillLeader {
+		return fmt.Errorf("no longer leader")
+	}
+
+	timeout := time.After(10 * time.Second) // more lenient under load
 
 	for {
 		select {
@@ -255,7 +284,8 @@ func (n *Node) waitForCommit(ctx context.Context, index uint64) error {
 			return ctx.Err()
 		case <-timeout:
 			return fmt.Errorf("timeout waiting for commit")
-		case <-ticker.C:
+		case <-n.commitNotifyCh:
+			// Got notification, check if our index is committed
 			n.mu.Lock()
 			committed := n.commitIndex >= index
 			stillLeader := n.state == Leader
@@ -266,7 +296,7 @@ func (n *Node) waitForCommit(ctx context.Context, index uint64) error {
 			}
 
 			if committed {
-				return nil
+				return nil // Success
 			}
 		}
 	}
@@ -288,14 +318,24 @@ func (n *Node) WaitForCommit(ctx context.Context) error {
 }
 
 func (n *Node) waitForApply(ctx context.Context, index uint64) error {
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
+	// Check immediately
+	n.mu.Lock()
+	if n.lastApplied >= index {
+		n.mu.Unlock()
+		return nil
+	}
+	n.mu.Unlock()
+
+	// Wait for notification
+	timeout := time.After(10 * time.Second)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
+		case <-timeout:
+			return fmt.Errorf("timeout waiting for apply")
+		case <-n.applyNotifyCh:
 			n.mu.Lock()
 			applied := n.lastApplied >= index
 			n.mu.Unlock()
@@ -319,7 +359,15 @@ func (n *Node) replicateToAll() {
 		if peerID == n.id {
 			continue
 		}
-		go n.replicateToPeer(peerID)
+		// Non-blocking enqueue
+		select {
+		case n.replicationQueue <- peerID:
+			// Task enqueued successfully
+		default:
+			// Queue full, skip (will retry on next heartbeat)
+			// This prevents unbounded goroutine growth
+		}
+		// go n.replicateToPeer(peerID)
 	}
 
 	n.mu.Unlock()
@@ -455,7 +503,7 @@ func (n *Node) replicateToPeer(peerID string) {
 	}
 
 	// Send AppendEntries RPC
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
 	req := &pb.AppendEntriesRequest{
@@ -474,27 +522,15 @@ func (n *Node) replicateToPeer(peerID string) {
 		n.replicationFailures[peerID]++
 		n.lastFailureTime[peerID] = time.Now()
 		failureCount := n.replicationFailures[peerID] // Read while holding lock
-		shouldLog := len(entries) > 0 && failureCount <= 3
+		shouldLogError := len(entries) > 0 && failureCount <= 3
 		n.mu.Unlock()
 
 		// Only log first few failures
-		if shouldLog {
+		if shouldLogError {
 			log.Printf("[%s] Failed to replicate to %s: %v (failure %d)", n.id, peerID, err, failureCount)
 		}
 		return
 	}
-
-	// // Log successful heartbeat occasionally (not every time - too noisy)
-	// if len(entries) == 0 {
-	// 	// Heartbeat success (log every 10th heartbeat to reduce noise)
-	// 	// Or just don't log at all
-	// } else {
-	// 	n.mu.Lock()
-	// 	n.replicationFailures[peerID] = 0
-	// 	delete(n.lastFailureTime, peerID)
-	// 	n.mu.Unlock()
-	// 	log.Printf("[%s] Replicated %d entries to %s", n.id, len(entries), peerID)
-	// }
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -534,7 +570,10 @@ func (n *Node) replicateToPeer(peerID string) {
 			n.matchIndex[peerID] = lastIdx
 			n.nextIndex[peerID] = lastIdx + 1
 
-			log.Printf("[%s] Peer %s replicated up to index %d", n.id, peerID, lastIdx)
+			// Log every 10th replication
+			if shouldLog(lastIdx, 10) {
+				log.Printf("[%s] Peer %s replicated up to index %d", n.id, peerID, lastIdx)
+			}
 
 			// Try to update commit index
 			n.updateCommitIndex()
@@ -543,7 +582,10 @@ func (n *Node) replicateToPeer(peerID string) {
 		// Consistency check failed, decrement nextIndex and retry
 		if n.nextIndex[peerID] > 1 {
 			n.nextIndex[peerID]--
-			log.Printf("[%s] Peer %s rejected, decrementing nextIndex to %d", n.id, peerID, n.nextIndex[peerID])
+			// Only log rejection occassionally
+			if shouldLog(n.nextIndex[peerID], 5) {
+				log.Printf("[%s] Peer %s rejected, decrementing nextIndex to %d", n.id, peerID, n.nextIndex[peerID])
+			}
 		}
 	}
 }
@@ -579,9 +621,18 @@ func (n *Node) updateCommitIndex() {
 
 		majority := len(n.peers)/2 + 1
 		if count >= majority {
-			log.Printf("[%s] Advancing commitIndex from %d to %d (majority confirmed: %d/%d)", n.id, n.commitIndex, N, count, len(n.peers))
+			oldCommit := n.commitIndex
 			n.commitIndex = N
 
+			// Notify waiters after updating commitIndex
+			select {
+			case n.commitNotifyCh <- struct{}{}: // signal sent
+			default: // channel full (someone already signaled), skip
+			}
+			// Sample logging
+			if shouldLog(N, 10) {
+				log.Printf("[%s] Advancing commitIndex from %d to %d (majority confirmed: %d/%d)", n.id, oldCommit, N, count, len(n.peers))
+			}
 			// Apply commited entries
 			go n.applyEntries()
 		} else {
@@ -657,7 +708,17 @@ func (n *Node) applyEntries() {
 		// Update lastApplied
 		n.mu.Lock()
 		n.lastApplied = entryIndex
-		log.Printf("[%s] Applied entry index=%d (lastApplied=%d, commitIndex=%d)", n.id, entryIndex, n.lastApplied, n.commitIndex)
+
+		// Notify waiters after updating lastApplied
+		select {
+		case n.applyNotifyCh <- struct{}{}:
+		default:
+		}
+
+		// Log every 10th entry
+		if shouldLog(entryIndex, 10) {
+			log.Printf("[%s] Applied entry index=%d (lastApplied=%d, commitIndex=%d)", n.id, entryIndex, n.lastApplied, n.commitIndex)
+		}
 		n.mu.Unlock()
 	}
 }
@@ -716,11 +777,42 @@ func (n *Node) Start() {
 	}
 	n.resetElectionTimer()
 	n.mu.Unlock()
+
+	// Start replication workers
+	n.startReplicationWorkers()
+
 	// Start periodic snapshot check
 	go n.periodicSnapshotCheck()
-
 	go n.reportFailures()
 	go n.run()
+}
+
+func (n *Node) startReplicationWorkers() {
+	// Start 10 workers (5 per peer for 2 peers)
+	// This limits concurrent replication goroutines
+	numWorkers := 10
+
+	log.Printf("[%s] Starting %d replication workers", n.id, numWorkers)
+
+	for i := range numWorkers {
+		go n.replicationWorkers(i)
+	}
+}
+
+// worker goroutine that processes replication tasks
+func (n *Node) replicationWorkers(workerID int) {
+	for {
+		select {
+		case peerID := <-n.replicationQueue:
+			// process replication task
+			n.replicateToPeer(peerID)
+		case <-n.replicationStop:
+			log.Printf("[%s] Replication worker %d stopping", n.id, workerID)
+			grpc.WithReturnConnectionError()
+		case <-n.shutdownCh:
+			return
+		}
+	}
 }
 
 func (n *Node) reportFailures() {
@@ -775,6 +867,7 @@ func (n *Node) becomeFollower(term uint64) {
 	// Stop heartbeat timer if running
 	if n.heartbeatTimer != nil {
 		n.heartbeatTimer.Stop()
+		n.heartbeatTimer = nil
 	}
 
 	n.resetElectionTimer()
@@ -966,9 +1059,12 @@ func (n *Node) startElection() {
 }
 
 func (n *Node) sendHeartbeats() {
+	ticker := time.NewTicker(HeartbeatInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
-		case <-n.heartbeatTimer.C:
+		case <-ticker.C:
 			// n.mu.Lock()
 			// if n.state != Leader { // status check
 			// 	n.mu.Unlock()
@@ -977,11 +1073,37 @@ func (n *Node) sendHeartbeats() {
 			// n.mu.Unlock()
 
 			// Replicate to all peers (includes heartbeat + log entries if any)
-			n.replicateToAll()
+			// n.replicateToAll()
+			n.sendHeartbeatImmediate()
+		case <-n.heartbeatCh:
+			// immediate heartbeat (bypass queue)
+			n.sendHeartbeatImmediate()
 		case <-n.shutdownCh:
 			log.Printf("[%s] Heartbeat goroutine shutting down", n.id)
 			return
 		}
+	}
+}
+
+func (n *Node) sendHeartbeatImmediate() {
+	// Send empty AppendEntries as heartbeat
+	// Faster than replicateToAll since we don't need to prepare entries
+	for peerID := range n.peers {
+		go func(peerID string) {
+			n.mu.Lock()
+			req := &pb.AppendEntriesRequest{
+				Term:         n.currentTerm,
+				LeaderId:     n.id,
+				LeaderCommit: n.commitIndex,
+				Entries:      nil, // Empty heartbeat
+			}
+			n.mu.Unlock()
+
+			client, _ := n.getClient(peerID)
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			client.AppendEntries(ctx, req)
+		}(peerID)
 	}
 }
 

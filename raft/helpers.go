@@ -194,3 +194,7 @@ func (n *Node) GetLeaderAddress() string {
 
 	return addr
 }
+
+func shouldLog(index uint64, sampleRate int) bool {
+	return index%uint64(sampleRate) == 0
+}

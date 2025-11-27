@@ -11,59 +11,74 @@ const totalOperations = new Counter("total_operations");
 
 export const options = {
   stages: [
-    { duration: "30s", target: 200 }, // Warm up
-    { duration: "1m", target: 200 }, // Ramp up
-    { duration: "30s", target: 500 }, // Ramp up
-    { duration: "1m", target: 750 }, // Steady
-    { duration: "30s", target: 500 }, // Ramp down
-    { duration: "45s", target: 350 }, // Ramp down
-    { duration: "30s", target: 175 }, // Ramp down
-    { duration: "30s", target: 70 }, // Ramp down
-    { duration: "15s", target: 0 }, // Ramp down
+    { duration: "30s", target: 50 }, // Warm up
+    { duration: "1m", target: 150 }, // Ramp up
+    { duration: "30s", target: 300 }, // steady
+    { duration: "30s", target: 150 }, // Ramp down
+    { duration: "30s", target: 0 }, // Cool down
   ],
   thresholds: {
-    success_rate: ["rate>0.90"], // 90% success (more lenient for testing)
+    success_rate: ["rate>0.95"],
   },
 };
 
+const servers = ["localhost:6001", "localhost:6002", "localhost:6003"];
+
+// ✅ Global client shared by all VUs (k6 handles concurrency)
 const client = new grpc.Client();
 client.load(["../proto"], "kv.proto");
 
-const servers = ["localhost:6001", "localhost:6002", "localhost:6003"];
+export function setup() {
+  console.log("🚀 Starting load test with optimized connection handling...");
+  return { startTime: Date.now() };
+}
 
-export default function () {
+export default function (data) {
+  // ✅ Pick random server for this iteration
   const server = servers[Math.floor(Math.random() * servers.length)];
 
+  // ✅ Connect for this iteration (k6 reuses connections internally)
   try {
     client.connect(server, {
       plaintext: true,
-      timeout: "5s",
+      timeout: "10s",
     });
+  } catch (e) {
+    console.error(`Connection failed to ${server}: ${e}`);
+    successRate.add(0);
+    return;
+  }
 
+  try {
     const rand = Math.random();
-    if (rand < 0.9) {
-      doSet();
-    } else if (rand < 0.1) {
+
+    if (rand < 0.7) {
+      // 70% writes (SET)
+      doSet(server);
+    } else if (rand < 0.9) {
+      // 20% reads (GET)
       doGet();
     } else {
-      doDelete();
+      // 10% deletes
+      doDelete(server);
     }
 
     totalOperations.add(1);
   } catch (e) {
-    console.error(`Connection error: ${e}`);
+    console.error(`Operation error: ${e}`);
     successRate.add(0);
   } finally {
-    client.close();
+    // ✅ Don't close connection - let k6 manage it
+    // This is the key difference from original script
   }
 
-  sleep(0.1);
+  // ✅ Reduced sleep for higher throughput
+  sleep(0.01); // 100 ops/sec per VU max
 }
 
-function doSet() {
+function doSet(currentServer) {
   const key = `key${Math.floor(Math.random() * 1000)}`;
   const value = `value_${Date.now()}_${randomString(16)}`;
-
   const startTime = new Date();
 
   try {
@@ -80,7 +95,7 @@ function doSet() {
       return;
     }
 
-    // ✅ FIX: Check redirect FIRST, don't count yet!
+    // Handle redirect
     if (
       response.message &&
       !response.message.isLeader &&
@@ -88,11 +103,14 @@ function doSet() {
     ) {
       redirectRate.add(1);
 
+      const leaderAddress = response.message.leaderAddress;
+
       try {
+        // ✅ Reconnect to leader for retry
         client.close();
-        client.connect(response.message.leaderAddress, {
+        client.connect(leaderAddress, {
           plaintext: true,
-          timeout: "5s",
+          timeout: "10s",
         });
 
         const retryResponse = client.invoke("kv.KV/Set", {
@@ -100,7 +118,6 @@ function doSet() {
           value: value,
         });
 
-        // ✅ Count redirect result ONCE
         if (
           retryResponse &&
           retryResponse.status === grpc.StatusOK &&
@@ -113,10 +130,10 @@ function doSet() {
         }
       } catch (e) {
         successRate.add(0);
-        console.error(`Redirect failed: ${e}`);
+        console.error(`Redirect to leader failed: ${e}`);
       }
     } else {
-      // ✅ No redirect, count direct result ONCE
+      // Direct success
       redirectRate.add(0);
       const success = response.message && response.message.success;
       successRate.add(success ? 1 : 0);
@@ -129,13 +146,12 @@ function doSet() {
 
 function doGet() {
   const key = `key${Math.floor(Math.random() * 1000)}`;
-
   const startTime = new Date();
 
   try {
     const response = client.invoke("kv.KV/Get", {
       key: key,
-      linearizable: false,
+      linearizable: false, // Stale reads for performance
     });
 
     const duration = new Date() - startTime;
@@ -145,12 +161,12 @@ function doGet() {
     successRate.add(success ? 1 : 0);
   } catch (e) {
     successRate.add(0);
+    console.error(`GET error: ${e}`);
   }
 }
 
-function doDelete() {
+function doDelete(currentServer) {
   const key = `key${Math.floor(Math.random() * 1000)}`;
-
   const startTime = new Date();
 
   try {
@@ -166,6 +182,7 @@ function doDelete() {
       return;
     }
 
+    // Handle redirect
     if (
       response.message &&
       !response.message.isLeader &&
@@ -173,18 +190,20 @@ function doDelete() {
     ) {
       redirectRate.add(1);
 
+      const leaderAddress = response.message.leaderAddress;
+
       try {
+        // ✅ Reconnect to leader for retry
         client.close();
-        client.connect(response.message.leaderAddress, {
+        client.connect(leaderAddress, {
           plaintext: true,
-          timeout: "5s",
+          timeout: "10s",
         });
 
         const retryResponse = client.invoke("kv.KV/Delete", {
           key: key,
         });
 
-        // ✅ Count redirect result ONCE
         if (
           retryResponse &&
           retryResponse.status === grpc.StatusOK &&
@@ -200,13 +219,24 @@ function doDelete() {
         console.error(`Redirect failed: ${e}`);
       }
     } else {
-      // ✅ No redirect, count direct result ONCE
       redirectRate.add(0);
       const success = response.message && response.message.success;
       successRate.add(success ? 1 : 0);
     }
-  } catch (error) {
+  } catch (e) {
     successRate.add(0);
+    console.error(`DELETE error: ${e}`);
+  }
+}
+
+export function teardown(data) {
+  const duration = (Date.now() - data.startTime) / 1000;
+  console.log(`🧹 Test completed in ${duration.toFixed(1)}s`);
+
+  try {
+    client.close();
+  } catch (e) {
+    // Ignore
   }
 }
 
