@@ -59,14 +59,9 @@ type Node struct {
 	lastSnapshotTime  time.Time
 	lastSnapshotIndex uint64
 
-	// Notification channels
-	commitNotifyCh chan struct{} // Broadcast when commitIndex advances
-	applyNotifyCh  chan struct{} // Broadcast when lastApplied advances
-
-	applyTrigerCh chan struct{} // Trigger immediate apply
-
-	// // Priority heartbeart channel
-	// heartbeatCh chan struct{} // Trigger immediate heartbeat
+	// Event-driven notification system
+	commitWaiters sync.Map
+	applyWaiters  sync.Map
 
 	// Worker pool for bounded replcation
 	replicationQueue chan string   // peerID to replicate to
@@ -85,38 +80,115 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 	}
 
 	node := &Node{
-		id:                id,
-		state:             Follower,
-		peers:             peers,
-		currentTerm:       0,
-		votedFor:          "",
-		log:               make([]*pb.LogEntry, 0),
-		commitIndex:       0,
-		lastApplied:       0,
-		leaderID:          "",
-		nextIndex:         make(map[string]uint64),
-		matchIndex:        make(map[string]uint64),
-		shutdownCh:        make(chan struct{}),
-		clients:           make(map[string]pb.RaftClient),
-		kvStore:           kv.NewKVStore(),
-		storage:           stor,
-		lastSnapshotTime:  time.Now(),
-		lastSnapshotIndex: 0,
-		commitNotifyCh:    make(chan struct{}, 128), // Buffer 128 to prevent blocking
-		applyNotifyCh:     make(chan struct{}, 1),
-		applyTrigerCh:     make(chan struct{}, 1),
-		// heartbeatCh:         make(chan struct{}, 1),
+		id:                  id,
+		state:               Follower,
+		peers:               peers,
+		currentTerm:         0,
+		votedFor:            "",
+		log:                 make([]*pb.LogEntry, 0),
+		commitIndex:         0,
+		lastApplied:         0,
+		leaderID:            "",
+		nextIndex:           make(map[string]uint64),
+		matchIndex:          make(map[string]uint64),
+		shutdownCh:          make(chan struct{}),
+		clients:             make(map[string]pb.RaftClient),
+		kvStore:             kv.NewKVStore(),
+		storage:             stor,
+		lastSnapshotTime:    time.Now(),
+		lastSnapshotIndex:   0,
 		replicationQueue:    make(chan string, 128), // Buffer 128 tasks
 		replicationStop:     make(chan struct{}),
 		replicationFailures: make(map[string]int),
 		lastFailureTime:     make(map[string]time.Time),
 	}
-
 	// Restore from disk
 	if err := node.restoreFromStorage(); err != nil {
 		return nil, fmt.Errorf("failed to restore from storage: %v", err)
 	}
 	return node, nil
+}
+
+// registerCommitWaiter adds a waiter channel for a specific index
+func (n *Node) registerCommitWaiter(index uint64) chan struct{} {
+	waiterCh := make(chan struct{})
+
+	// Load existing waiters or create new slice
+	actual, _ := n.commitWaiters.LoadOrStore(index, &sync.Mutex{})
+	mu := actual.(*sync.Mutex)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Get or create waiter list
+	waitersInterface, ok := n.commitWaiters.Load(index)
+	var waiters []chan struct{}
+	if ok {
+		waiters = waitersInterface.([]chan struct{})
+	}
+
+	// Append new waietr
+	waiters = append(waiters, waiterCh)
+	n.commitWaiters.Store(index, waiters)
+
+	return waiterCh
+}
+
+// registerApplyWaiter has similar logic to registerCommitWaiter
+func (n *Node) registerApplyWaiter(index uint64) chan struct{} {
+	waiterCh := make(chan struct{})
+
+	waitersInterface, _ := n.applyWaiters.LoadOrStore(index, []chan struct{}{})
+	waiters := waitersInterface.([]chan struct{})
+	waiters = append(waiters, waiterCh)
+	n.applyWaiters.Store(index, waiters)
+
+	return waiterCh
+}
+
+// unregisterCommitWaiter removes a waiter (for cleanup on timeout/cancel)
+func (n *Node) unregisterCommitWaiter(index uint64, waiterCh chan struct{}) {
+	waitersInterface, ok := n.commitWaiters.Load(index)
+	if !ok {
+		return
+	}
+
+	waiters := waitersInterface.([]chan struct{})
+
+	// Remove this specific channel
+	newWaiters := make([]chan struct{}, 0, len(waiters))
+	for _, ch := range waiters {
+		if ch != waiterCh {
+			newWaiters = append(newWaiters, ch)
+		}
+	}
+
+	if len(newWaiters) == 0 {
+		n.commitWaiters.Delete(index)
+	} else {
+		n.commitWaiters.Store(index, newWaiters)
+	}
+}
+
+func (n *Node) unregisterApplyWaiter(index uint64, waiterCh chan struct{}) {
+	waitersInterface, ok := n.applyWaiters.Load(index)
+	if !ok {
+		return
+	}
+
+	waiters := waitersInterface.([]chan struct{})
+	newWaiters := make([]chan struct{}, 0, len(waiters))
+	for _, ch := range waiters {
+		if ch != waiterCh {
+			newWaiters = append(newWaiters, ch)
+		}
+	}
+
+	if len(newWaiters) == 0 {
+		n.applyWaiters.Delete(index)
+	} else {
+		n.applyWaiters.Store(index, newWaiters)
+	}
 }
 
 // restoreFromStorage loads persistent state from disk
@@ -270,40 +342,39 @@ func (n *Node) Propose(ctx context.Context, command []byte) (uint64, error) {
 
 // waitForCommit waits until the given index is committed
 func (n *Node) waitForCommit(ctx context.Context, index uint64) error {
-	// Check immediately first (optimization)
+	// Fast path: check immediately
 	n.mu.Lock()
 	if n.commitIndex >= index {
 		n.mu.Unlock()
 		return nil
 	}
-
-	stillLeader := n.state == Leader
+	if n.state != Leader {
+		n.mu.Unlock()
+		return fmt.Errorf("not leader")
+	}
 	n.mu.Unlock()
 
-	if !stillLeader {
-		return fmt.Errorf("no longer leader")
-	}
+	// Register waiter for this specific index
+	waiterCh := n.registerCommitWaiter(index)
+	defer n.unregisterCommitWaiter(index, waiterCh)
 
-	timeout := time.After(10 * time.Second) // more lenient under load
+	// Fallback ticker (safety net if notification missed)
+	ticker := time.NewTicker(200 * time.Millisecond) // slow fallback only
+	defer ticker.Stop()
+
+	timeout := time.After(10 * time.Second)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timeout:
-			return fmt.Errorf("timeout waiting for commit")
-		case <-n.commitNotifyCh:
-			// Drain any queue notifications
-		drainLoop:
-			for {
-				select {
-				case <-n.commitNotifyCh:
-					// keep draining
-				default:
-					break drainLoop
-				}
-			}
-			// Got notification, check if our index is committed
+			n.mu.Lock()
+			current := n.commitIndex
+			n.mu.Unlock()
+			return fmt.Errorf("timeout waiting for commit (current=%d, target=%d)", current, index)
+		case <-waiterCh:
+			// Got notified, verify and return
 			n.mu.Lock()
 			committed := n.commitIndex >= index
 			stillLeader := n.state == Leader
@@ -314,7 +385,22 @@ func (n *Node) waitForCommit(ctx context.Context, index uint64) error {
 			}
 
 			if committed {
-				return nil // Success
+				return nil // success
+			}
+			// edge case: notification but not committed yet, wait again
+		case <-ticker.C:
+			// Fallback: periodic check in case notification missed
+			n.mu.Lock()
+			committed := n.commitIndex >= index
+			stillLeader := n.state == Leader
+			n.mu.Unlock()
+
+			if !stillLeader {
+				return fmt.Errorf("no longer leader")
+			}
+
+			if committed {
+				return nil // success
 			}
 		}
 	}
@@ -335,8 +421,8 @@ func (n *Node) WaitForCommit(ctx context.Context) error {
 	return n.waitForApply(ctx, readIndex)
 }
 
+// waitForApply waits until lastApplied >= index, similar to waitForCommit
 func (n *Node) waitForApply(ctx context.Context, index uint64) error {
-	// Check immediately
 	n.mu.Lock()
 	if n.lastApplied >= index {
 		n.mu.Unlock()
@@ -344,7 +430,12 @@ func (n *Node) waitForApply(ctx context.Context, index uint64) error {
 	}
 	n.mu.Unlock()
 
-	// Wait for notification
+	waiterCh := n.registerApplyWaiter(index)
+	defer n.unregisterApplyWaiter(index, waiterCh)
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
 	timeout := time.After(10 * time.Second)
 
 	for {
@@ -353,11 +444,17 @@ func (n *Node) waitForApply(ctx context.Context, index uint64) error {
 			return ctx.Err()
 		case <-timeout:
 			return fmt.Errorf("timeout waiting for apply")
-		case <-n.applyNotifyCh:
+		case <-waiterCh:
 			n.mu.Lock()
 			applied := n.lastApplied >= index
 			n.mu.Unlock()
-
+			if applied {
+				return nil
+			}
+		case <-ticker.C:
+			n.mu.Lock()
+			applied := n.lastApplied >= index
+			n.mu.Unlock()
 			if applied {
 				return nil
 			}
@@ -619,7 +716,6 @@ func (n *Node) updateCommitIndex() {
 	// Caller must hold n.mu
 
 	lastLogIndex := n.getLastLogIndex()
-
 	// Find highest N where majority has replicated
 	for N := n.commitIndex + 1; N <= lastLogIndex; N++ {
 		// Find entry at index N
@@ -648,30 +744,38 @@ func (n *Node) updateCommitIndex() {
 			oldCommit := n.commitIndex
 			n.commitIndex = N
 
-			// Notify waiters after updating commitIndex
-			select {
-			case n.commitNotifyCh <- struct{}{}: // signal sent
-			default: // channel full (someone already signaled), skip
+			// Notify all waiters for indices up to N
+			for idx := oldCommit + 1; idx <= N; idx++ {
+				n.notifyCommitWaiters(idx)
 			}
+
 			// Sample logging
 			if shouldLog(N, 10) {
 				log.Printf("[%s] Advancing commitIndex from %d to %d (majority confirmed: %d/%d)", n.id, oldCommit, N, count, len(n.peers))
 			}
-			// Apply commited entries
-			select {
-			case n.applyTrigerCh <- struct{}{}:
-			default:
-			}
+			go n.applyEntries()
 		} else {
 			break // Can't commit higher indices yet
 		}
 	}
 }
 
-func (n *Node) applyLoop() {
-	for range n.applyTrigerCh {
-		n.applyEntries()
+// notifyCommitWaiters wakes up all goroutines waiting for this index
+func (n *Node) notifyCommitWaiters(index uint64) {
+	waitersInterface, ok := n.commitWaiters.Load(index)
+	if !ok {
+		return // no waiters for this index
 	}
+
+	waiters := waitersInterface.([]chan struct{})
+
+	// Close all waiter channels (broadcast to all waiters)
+	for _, waiterCh := range waiters {
+		close(waiterCh) // Safe to close multiple times? No, so we track
+	}
+
+	// Remove from map (cleanup)
+	n.commitWaiters.Delete(index)
 }
 
 // applyEntries applies committed entries to state machine
@@ -742,19 +846,28 @@ func (n *Node) applyEntries() {
 		// Update lastApplied
 		n.mu.Lock()
 		n.lastApplied = entryIndex
-
-		// Notify waiters after updating lastApplied
-		select {
-		case n.applyNotifyCh <- struct{}{}:
-		default:
-		}
-
+		n.notifyApplyWaiters(entryIndex)
 		// Log every 10th entry
 		if shouldLog(entryIndex, 10) {
 			log.Printf("[%s] Applied entry index=%d (lastApplied=%d, commitIndex=%d)", n.id, entryIndex, n.lastApplied, n.commitIndex)
 		}
 		n.mu.Unlock()
 	}
+}
+
+func (n *Node) notifyApplyWaiters(index uint64) {
+	waitersInterface, ok := n.applyWaiters.Load(index)
+	if !ok {
+		return
+	}
+
+	waiters := waitersInterface.([]chan struct{})
+
+	for _, waiterCh := range waiters {
+		close(waiterCh)
+	}
+
+	n.applyWaiters.Delete(index)
 }
 
 // Lazy get client with retry
@@ -818,13 +931,12 @@ func (n *Node) Start() {
 	go n.periodicSnapshotCheck()
 	go n.reportFailures()
 	go n.run()
-	go n.applyLoop()
 }
 
 func (n *Node) startReplicationWorkers() {
 	// Start 25 workers (12 per peer for 2 peers)
 	// This limits concurrent replication goroutines
-	numWorkers := 25
+	numWorkers := 15
 
 	log.Printf("[%s] Starting %d replication workers", n.id, numWorkers)
 
@@ -997,7 +1109,6 @@ func (n *Node) startElection() {
 
 	votes := 1 // vote for self
 	var voteMu sync.Mutex
-
 	// Send RequestVote RPCs to all peers
 	for peerID := range n.peers {
 		if peerID == n.id {
@@ -1103,22 +1214,24 @@ func (n *Node) sendHeartbeats() {
 	}
 }
 
-// func (n *Node) sendHeartbeatImmediate() {
-// 	// Send empty AppendEntries as heartbeat
-// 	// Faster than replicateToAll since we don't need to prepare entries
-// 	for peerID := range n.peers {
-// 		if peerID == n.id {
-// 			continue
-// 		}
-
-// 		select {
-// 		case n.replicationQueue <- peerID:
-// 		default:
-// 		}
-// 	}
-// }
-
 func (n *Node) Shutdown() {
+	// Close all pending waiters
+	n.commitWaiters.Range(func(key, value any) bool {
+		waiters := value.([]chan struct{})
+		for _, ch := range waiters {
+			close(ch)
+		}
+		return true
+	})
+
+	n.applyWaiters.Range(func(key, value any) bool {
+		waiters := value.([]chan struct{})
+		for _, ch := range waiters {
+			close(ch)
+		}
+		return true
+	})
+
 	// Stop worker pool
 	close(n.replicationStop)
 
