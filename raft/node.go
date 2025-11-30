@@ -72,6 +72,11 @@ type Node struct {
 	lastFailureTime     map[string]time.Time // peerID -> last failure time
 }
 
+type waitersEntry struct {
+	mu      sync.Mutex
+	waiters []chan struct{}
+}
+
 func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) {
 	// Open Storage
 	stor, err := storage.NewBadgerStroage(filepath.Join(dataDir, id))
@@ -111,25 +116,16 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 
 // registerCommitWaiter adds a waiter channel for a specific index
 func (n *Node) registerCommitWaiter(index uint64) chan struct{} {
+
 	waiterCh := make(chan struct{})
 
 	// Load existing waiters or create new slice
-	actual, _ := n.commitWaiters.LoadOrStore(index, &sync.Mutex{})
-	mu := actual.(*sync.Mutex)
+	actual, _ := n.commitWaiters.LoadOrStore(index, &waitersEntry{})
+	entry := actual.(*waitersEntry)
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Get or create waiter list
-	waitersInterface, ok := n.commitWaiters.Load(index)
-	var waiters []chan struct{}
-	if ok {
-		waiters = waitersInterface.([]chan struct{})
-	}
-
-	// Append new waietr
-	waiters = append(waiters, waiterCh)
-	n.commitWaiters.Store(index, waiters)
+	entry.mu.Lock()
+	entry.waiters = append(entry.waiters, waiterCh)
+	entry.mu.Unlock()
 
 	return waiterCh
 }
@@ -138,56 +134,62 @@ func (n *Node) registerCommitWaiter(index uint64) chan struct{} {
 func (n *Node) registerApplyWaiter(index uint64) chan struct{} {
 	waiterCh := make(chan struct{})
 
-	waitersInterface, _ := n.applyWaiters.LoadOrStore(index, []chan struct{}{})
-	waiters := waitersInterface.([]chan struct{})
-	waiters = append(waiters, waiterCh)
-	n.applyWaiters.Store(index, waiters)
+	actual, _ := n.applyWaiters.LoadOrStore(index, &waitersEntry{})
+	entry := actual.(*waitersEntry)
+
+	entry.mu.Lock()
+	entry.waiters = append(entry.waiters, waiterCh)
+	entry.mu.Unlock()
 
 	return waiterCh
 }
 
 // unregisterCommitWaiter removes a waiter (for cleanup on timeout/cancel)
 func (n *Node) unregisterCommitWaiter(index uint64, waiterCh chan struct{}) {
-	waitersInterface, ok := n.commitWaiters.Load(index)
+	actual, ok := n.commitWaiters.Load(index)
 	if !ok {
 		return
 	}
+	entry := actual.(*waitersEntry)
 
-	waiters := waitersInterface.([]chan struct{})
-
-	// Remove this specific channel
-	newWaiters := make([]chan struct{}, 0, len(waiters))
-	for _, ch := range waiters {
+	entry.mu.Lock()
+	// filter out the channel
+	new := entry.waiters[:0]
+	for _, ch := range entry.waiters {
 		if ch != waiterCh {
-			newWaiters = append(newWaiters, ch)
+			new = append(new, ch)
 		}
 	}
+	entry.waiters = new
+	empty := len(entry.waiters) == 0
+	entry.mu.Unlock()
 
-	if len(newWaiters) == 0 {
+	if empty {
+		// safe to delete; other goroutines will re-create on demand
 		n.commitWaiters.Delete(index)
-	} else {
-		n.commitWaiters.Store(index, newWaiters)
 	}
 }
 
 func (n *Node) unregisterApplyWaiter(index uint64, waiterCh chan struct{}) {
-	waitersInterface, ok := n.applyWaiters.Load(index)
+	actual, ok := n.applyWaiters.Load(index)
 	if !ok {
 		return
 	}
+	entry := actual.(*waitersEntry)
 
-	waiters := waitersInterface.([]chan struct{})
-	newWaiters := make([]chan struct{}, 0, len(waiters))
-	for _, ch := range waiters {
+	entry.mu.Lock()
+	new := entry.waiters[:0]
+	for _, ch := range entry.waiters {
 		if ch != waiterCh {
-			newWaiters = append(newWaiters, ch)
+			new = append(new, ch)
 		}
 	}
+	entry.waiters = new
+	empty := len(entry.waiters) == 0
+	entry.mu.Unlock()
 
-	if len(newWaiters) == 0 {
+	if empty {
 		n.applyWaiters.Delete(index)
-	} else {
-		n.applyWaiters.Store(index, newWaiters)
 	}
 }
 
@@ -324,7 +326,6 @@ func (n *Node) Propose(ctx context.Context, command []byte) (uint64, error) {
 
 	// Wait for commit before returning
 	if err := n.waitForCommit(ctx, index); err != nil {
-		n.mu.Unlock()
 		return 0, fmt.Errorf("failed to commit: %v", err)
 	}
 
@@ -470,17 +471,10 @@ func (n *Node) replicateToAll() {
 		return
 	}
 
-	peers := make([]string, 0, len(n.peers))
 	for peerID := range n.peers {
 		if peerID == n.id {
 			continue
 		}
-		peers = append(peers, peerID)
-	}
-
-	n.mu.Unlock()
-
-	for _, peerID := range peers {
 		// Non-blocking enqueue
 		select {
 		case n.replicationQueue <- peerID:
@@ -491,7 +485,7 @@ func (n *Node) replicateToAll() {
 		}
 		// go n.replicateToPeer(peerID)
 	}
-
+	n.mu.Unlock()
 }
 
 // replicateToPeer sends AppendEntries to a specific peer
@@ -762,20 +756,24 @@ func (n *Node) updateCommitIndex() {
 
 // notifyCommitWaiters wakes up all goroutines waiting for this index
 func (n *Node) notifyCommitWaiters(index uint64) {
-	waitersInterface, ok := n.commitWaiters.Load(index)
+	actual, ok := n.commitWaiters.Load(index)
 	if !ok {
-		return // no waiters for this index
+		return
 	}
+	entry := actual.(*waitersEntry)
 
-	waiters := waitersInterface.([]chan struct{})
+	// Lock, copy slice, and remove from map BEFORE closing channels to avoid races/duplicate close
+	entry.mu.Lock()
+	waitersCopy := make([]chan struct{}, len(entry.waiters))
+	copy(waitersCopy, entry.waiters)
+	entry.mu.Unlock()
 
-	// Close all waiter channels (broadcast to all waiters)
-	for _, waiterCh := range waiters {
-		close(waiterCh) // Safe to close multiple times? No, so we track
-	}
-
-	// Remove from map (cleanup)
+	// Remove from map so re-registrations create a new entry if needed
 	n.commitWaiters.Delete(index)
+
+	for _, ch := range waitersCopy {
+		close(ch)
+	}
 }
 
 // applyEntries applies committed entries to state machine
@@ -856,18 +854,22 @@ func (n *Node) applyEntries() {
 }
 
 func (n *Node) notifyApplyWaiters(index uint64) {
-	waitersInterface, ok := n.applyWaiters.Load(index)
+	actual, ok := n.applyWaiters.Load(index)
 	if !ok {
 		return
 	}
+	entry := actual.(*waitersEntry)
 
-	waiters := waitersInterface.([]chan struct{})
-
-	for _, waiterCh := range waiters {
-		close(waiterCh)
-	}
+	entry.mu.Lock()
+	waitersCopy := make([]chan struct{}, len(entry.waiters))
+	copy(waitersCopy, entry.waiters)
+	entry.mu.Unlock()
 
 	n.applyWaiters.Delete(index)
+
+	for _, ch := range waitersCopy {
+		close(ch)
+	}
 }
 
 // Lazy get client with retry
@@ -1217,17 +1219,26 @@ func (n *Node) sendHeartbeats() {
 func (n *Node) Shutdown() {
 	// Close all pending waiters
 	n.commitWaiters.Range(func(key, value any) bool {
-		waiters := value.([]chan struct{})
-		for _, ch := range waiters {
-			close(ch)
+		if entry, ok := value.(*waitersEntry); ok {
+			entry.mu.Lock()
+			waiters := make([]chan struct{}, len(entry.waiters))
+			copy(waiters, entry.waiters)
+			entry.mu.Unlock()
+			for _, ch := range waiters {
+				close(ch)
+			}
 		}
 		return true
 	})
-
 	n.applyWaiters.Range(func(key, value any) bool {
-		waiters := value.([]chan struct{})
-		for _, ch := range waiters {
-			close(ch)
+		if entry, ok := value.(*waitersEntry); ok {
+			entry.mu.Lock()
+			waiters := make([]chan struct{}, len(entry.waiters))
+			copy(waiters, entry.waiters)
+			entry.mu.Unlock()
+			for _, ch := range waiters {
+				close(ch)
+			}
 		}
 		return true
 	})
