@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/kvpb"
 	"github.com/Xenn-00/distributed-kv-store/raft"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 type KVServer struct {
@@ -86,7 +88,7 @@ func (s *KVServer) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse
 	}
 
 	// Propose to Raft (blocks until committed or timeout)
-	index, err := s.node.Propose(ctx, cmdBytes)
+	index, err := s.node.ProposalAsync(ctx, cmdBytes)
 	if err != nil {
 		// Check if we're still leader
 		if !s.node.IsLeader() {
@@ -129,7 +131,7 @@ func (s *KVServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Delet
 		return nil, fmt.Errorf("failed to marshal command: %v", err)
 	}
 
-	index, err := s.node.Propose(ctx, cmdBytes)
+	index, err := s.node.ProposalAsync(ctx, cmdBytes)
 	if err != nil {
 		if !s.node.IsLeader() {
 			resp.IsLeader = false
@@ -168,7 +170,27 @@ func (s *KVServer) Start(address string) error {
 		return fmt.Errorf("failed to listen: %v", err)
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		// Limit concurrent streams per connection
+		grpc.MaxConcurrentStreams(100),
+
+		// Limit max message size received
+		grpc.MaxRecvMsgSize(4*1024*1024), // 4MB
+
+		// Limit max message size send
+		grpc.MaxSendMsgSize(4*1024*1024),
+
+		// Set keep alive params
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: 5 * time.Minute,
+			MaxConnectionAge:  10 * time.Minute,
+			Time:              1 * time.Minute,
+			Timeout:           20 * time.Second,
+		}),
+
+		// Connection timeout
+		grpc.ConnectionTimeout(10*time.Second),
+	)
 	pb.RegisterKVServer(grpcServer, s)
 
 	log.Printf("gRPC server listening on %s", address)

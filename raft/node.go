@@ -63,6 +63,11 @@ type Node struct {
 	commitWaiters sync.Map
 	applyWaiters  sync.Map
 
+	// Proposal queue system
+	proposalQueue chan *proposalRequest // Bounded queue
+	ProposalSem   chan struct{}         // Semaphore for in-flight
+	proposalStop  chan struct{}         // Stop proposal processor
+
 	// Worker pool for bounded replcation
 	replicationQueue chan string   // peerID to replicate to
 	replicationStop  chan struct{} // stop workers
@@ -75,6 +80,17 @@ type Node struct {
 type waitersEntry struct {
 	mu      sync.Mutex
 	waiters []chan struct{}
+}
+
+type proposalRequest struct {
+	command []byte
+	respCh  chan *proposalResponse
+	ctx     context.Context
+}
+
+type proposalResponse struct {
+	index uint64
+	err   error
 }
 
 func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) {
@@ -102,6 +118,9 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 		storage:             stor,
 		lastSnapshotTime:    time.Now(),
 		lastSnapshotIndex:   0,
+		proposalQueue:       make(chan *proposalRequest, 200), // Max 200 queued
+		ProposalSem:         make(chan struct{}, 100),         // Max 100 in-flight
+		proposalStop:        make(chan struct{}),
 		replicationQueue:    make(chan string, 128), // Buffer 128 tasks
 		replicationStop:     make(chan struct{}),
 		replicationFailures: make(map[string]int),
@@ -112,6 +131,56 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 		return nil, fmt.Errorf("failed to restore from storage: %v", err)
 	}
 	return node, nil
+}
+
+// processProposals is the single dispatcher goroutine
+func (n *Node) processProposals() {
+	for {
+		select {
+		case req := <-n.proposalQueue:
+			// Acquire semaphore (blocks if 100 in-flight)
+			select {
+			case n.ProposalSem <- struct{}{}:
+				// Got semaphore, spawn worker
+				go n.handleProposal(req)
+			case <-n.proposalStop:
+				// Shutdown requested, reject this proposal
+				req.respCh <- &proposalResponse{
+					err: fmt.Errorf("node shutting down"),
+				}
+				return
+			}
+		case <-n.proposalStop:
+			log.Printf("[%s] Proposal processor stopping", n.id)
+			return
+		}
+	}
+}
+
+// handleProposal processes a single proposal (runs in goroutine)
+func (n *Node) handleProposal(req *proposalRequest) {
+	// Critical: always release semaphore
+	defer func() { <-n.ProposalSem }()
+
+	// Check context first (might be cancelled)
+	select {
+	case <-req.ctx.Done():
+		req.respCh <- &proposalResponse{err: req.ctx.Err()}
+		return
+	default:
+	}
+
+	// Call internal propose logic
+	index, err := n.proposeInternal(req.ctx, req.command)
+
+	// Send response back (non-blocking)
+	select {
+	case req.respCh <- &proposalResponse{index: index, err: err}:
+		// response sent
+	case <-time.After(100 * time.Millisecond):
+		// Client gave up, log and move on
+		log.Printf("[%s] Client abandoned proposal for index %d", n.id, index)
+	}
 }
 
 // registerCommitWaiter adds a waiter channel for a specific index
@@ -282,8 +351,46 @@ func (n *Node) restoreFromStorage() error {
 	return nil
 }
 
-// Propose: propose a new command to the cluster (only leader)
-func (n *Node) Propose(ctx context.Context, command []byte) (uint64, error) {
+// ProposeAsync queues a proposal with backpressure
+func (n *Node) ProposalAsync(ctx context.Context, command []byte) (uint64, error) {
+	// Fast path: Check if leader
+	n.mu.Lock()
+	if n.state != Leader {
+		leaderAddress := n.GetLeaderAddress()
+		n.mu.Unlock()
+		return 0, &NotLeaderError{LeaderAddr: leaderAddress}
+	}
+	n.mu.Unlock()
+
+	// Create request
+	req := &proposalRequest{
+		command: command,
+		respCh:  make(chan *proposalResponse, 1), // Buffered
+		ctx:     ctx,
+	}
+
+	// Try to enqueue with timeout (backpressure)
+	select {
+	case n.proposalQueue <- req:
+		// Queue successfully, wait for response
+	case <-time.After(100 * time.Millisecond):
+		// Queue full, return backpressure error
+		return 0, fmt.Errorf("proposal queue full (backpressure)")
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+
+	// Wait for response from worker
+	select {
+	case resp := <-req.respCh:
+		return resp.index, resp.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// Propose: propose a new command to the cluster (only leader) -> mutate into proposeInternal
+func (n *Node) proposeInternal(ctx context.Context, command []byte) (uint64, error) {
 	n.mu.Lock()
 
 	// Only leader can propose
@@ -927,6 +1034,8 @@ func (n *Node) Start() {
 	n.resetElectionTimer()
 	n.mu.Unlock()
 
+	go n.processProposals()
+
 	// Start replication workers
 	n.startReplicationWorkers()
 	// Start periodic snapshot check
@@ -1217,6 +1326,18 @@ func (n *Node) sendHeartbeats() {
 }
 
 func (n *Node) Shutdown() {
+
+	// Stop proposal processor first
+	close(n.proposalStop)
+
+	// Drain pending proposals
+	close(n.proposalQueue)
+	for req := range n.proposalQueue {
+		req.respCh <- &proposalResponse{
+			err: fmt.Errorf("node shutting down"),
+		}
+	}
+
 	// Close all pending waiters
 	n.commitWaiters.Range(func(key, value any) bool {
 		if entry, ok := value.(*waitersEntry); ok {

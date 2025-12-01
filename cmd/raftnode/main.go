@@ -133,7 +133,7 @@ func startCLI(node *raft.Node, nodeID string) {
 
 			// Propose with context (5s timeout)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			index, err := node.Propose(ctx, cmdBytes)
+			index, err := node.ProposalAsync(ctx, cmdBytes)
 			cancel()
 
 			if err != nil {
@@ -186,7 +186,7 @@ func startCLI(node *raft.Node, nodeID string) {
 
 			// Propose with context
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			index, err := node.Propose(ctx, cmdBytes)
+			index, err := node.ProposalAsync(ctx, cmdBytes)
 			cancel()
 
 			if err != nil {
@@ -225,6 +225,8 @@ func startCLI(node *raft.Node, nodeID string) {
 
 			fmt.Printf("Node: %s\n", nodeID)
 			fmt.Printf("Leader: %v\n", isLeader)
+
+			// fmt.Printf("Replication status: %v\n", replicationStatus)
 
 			if !isLeader {
 				if leaderID != "" {

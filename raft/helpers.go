@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"strconv"
@@ -171,6 +172,17 @@ func (n *Node) IsLeader() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.state == Leader
+}
+
+type NotLeaderError struct {
+	LeaderAddr string
+}
+
+func (e *NotLeaderError) Error() string {
+	if e.LeaderAddr == "" {
+		return "not leader (leader unknown)"
+	}
+	return fmt.Sprintf("not leader (redirect to %s)", e.LeaderAddr)
 }
 
 // GetLeaderAddress return address leader (perfect for redirect)

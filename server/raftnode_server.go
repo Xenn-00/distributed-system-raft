@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
 	"github.com/Xenn-00/distributed-kv-store/raft"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 type RaftServer struct {
@@ -38,7 +40,24 @@ func (s *RaftServer) Start(address string) error {
 		return fmt.Errorf("failed to listen: %v", err)
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		// Limit concurrent streams per connection
+		grpc.MaxConcurrentStreams(50),
+
+		// Limit max message size received
+		grpc.MaxRecvMsgSize(16*1024*1024), // 16MB
+
+		// Limit max message size send
+		grpc.MaxSendMsgSize(16*1024*1024),
+
+		// Set keep alive params
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: 15 * time.Minute,
+			MaxConnectionAge:  30 * time.Minute,
+			Time:              30 * time.Second,
+			Timeout:           10 * time.Second,
+		}),
+	)
 	pb.RegisterRaftServer(grpcServer, s)
 
 	log.Printf("gRPC server listening on %s", address)

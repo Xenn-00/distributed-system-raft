@@ -10,13 +10,23 @@ const deleteLatency = new Trend("delete_latency");
 const totalOperations = new Counter("total_operations");
 
 export const options = {
-  stages: [
-    { duration: "10s", target: 10 }, // Warm up
-    { duration: "15s", target: 20 }, // Ramp up
-    { duration: "30s", target: 50 }, // steady
-    { duration: "15s", target: 0 }, // Ramp down
-    // { duration: "10s", target: 0 }, // Cool down
-  ],
+  // stages: [
+  //   { duration: "10s", target: 10 }, // Warm up
+  //   { duration: "15s", target: 20 }, // Ramp up
+  //   { duration: "30s", target: 50 }, // steady
+  //   { duration: "15s", target: 20 }, // Ramp down
+  //   { duration: "10s", target: 0 }, // Cool down
+  // ],
+  scenarios: {
+    constant_load: {
+      executor: "constant-arrival-rate",
+      rate: 500, // 500 req/s max
+      timeUnit: "1s",
+      duration: "1m",
+      preAllocatedVUs: 50,
+      maxVUs: 200,
+    },
+  },
   thresholds: {
     success_rate: ["rate>0.95"],
   },
