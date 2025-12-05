@@ -1,0 +1,222 @@
+package raft
+
+import (
+	"context"
+	"log"
+	"math/rand"
+	"sync"
+	"time"
+
+	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
+)
+
+func (n *Node) becomeFollower(term uint64) {
+	// n.mu.Lock()
+	// defer n.mu.Unlock()
+
+	n.StopPipelinedReplication()
+
+	if term == 0 {
+		n.state = Follower   // Change node's state to follower
+		n.currentTerm = term // Update current term
+		n.votedFor = ""      // Reset votedFor
+		n.leaderID = ""      // Clear leader when stepping down
+	} else {
+		// Already restored from disk
+		n.state = Follower
+		// Keep currentTerm, votedFor as-is
+	}
+
+	// Stop heartbeat timer if running
+	if n.heartbeatTimer != nil {
+		n.heartbeatTimer.Stop()
+		n.heartbeatTimer = nil
+	}
+
+	n.resetElectionTimer()
+	log.Printf("[%s] Became FOLLOWER at term %d", n.id, n.currentTerm)
+}
+
+func (n *Node) becomeCandidate() {
+	// Caller should hold n.mu.lock
+	// n.mu.Lock()
+	// defer n.mu.Unlock()
+
+	n.state = Candidate // Change node's state to candidate
+	n.currentTerm++     // Increment current term (starting a new election)
+	n.votedFor = n.id   // vote for self
+
+	// Persist state
+	if err := n.storage.SaveTerm(n.currentTerm); err != nil {
+		log.Printf("[%s] Failed to save term: %v", n.id, err)
+	}
+	if err := n.storage.SaveVote(n.votedFor); err != nil {
+		log.Printf("[%s] Failed to save vote: %v", n.id, err)
+	}
+
+	log.Printf("[%s] Became CANDIDATE at term %d", n.id, n.currentTerm)
+}
+
+func (n *Node) becomeLeader() {
+	// Caller should hold n.mu.lock
+
+	n.state = Leader  // Change node's state to leader
+	n.leaderID = n.id // Set self as leader
+
+	// Initialize leader state (including snapshot)
+	lastLogIndex := n.getLastLogIndex()
+	for peerID := range n.peers {
+		if peerID == n.id {
+			continue
+		}
+		n.nextIndex[peerID] = lastLogIndex + 1 // next log index to send to each follower
+		n.matchIndex[peerID] = 0               // highest log index known to be replicated on each follower
+	}
+
+	// Stop election timer, start heartbeat timer
+	if n.electionTimer != nil {
+		n.electionTimer.Stop()
+	}
+	n.heartbeatTimer = time.NewTicker(HeartbeatInterval)
+
+	log.Printf("[%s] Became LEADER at term %d (lastLogIndex=%d)", n.id, n.currentTerm, lastLogIndex)
+
+	// Send Immediate heartbeat to estabilish authority
+	// go func() {
+	// 	n.mu.Lock()
+	// 	if n.state == Leader {
+	// 		log.Printf("[%s] Sending immediate heartbeat to estabilish leadership", n.id)
+	// 		n.mu.Unlock()
+	// 		n.replicateToAll()
+	// 	} else {
+	// 		n.mu.Unlock()
+	// 	}
+	// }()
+
+	go n.StartPipelinedReplication()
+	// Start sending heartbeats
+	go n.sendHeartbeats()
+}
+
+func (n *Node) resetElectionTimer() {
+	timeout := ElectionTimeoutMin + time.Duration(rand.Int63n(int64(ElectionTimeoutMax-ElectionTimeoutMin)))
+
+	if n.electionTimer == nil {
+		n.electionTimer = time.NewTimer(timeout)
+	} else {
+		n.electionTimer.Reset(timeout)
+	}
+}
+
+func (n *Node) startElection() {
+	n.becomeCandidate() // Transition to candidate state
+	// Prepare RequestVote RPC parameters
+	n.mu.Lock()
+	currentTerm := n.currentTerm
+	candidateId := n.id
+
+	// Get last log info (handles snapshot automatically)
+	lastLogIndex := n.getLastLogIndex() // collecting log info from last log entry
+	lastLogTerm := n.getLastLogTerm()   // collecting term info from last log entry
+	// if lastLogIndex > 0 {
+	// 	lastLogTerm = n.log[lastLogIndex-1].Term
+	// }
+	n.mu.Unlock()
+
+	log.Printf("[%s] Starting election for term %d", n.id, currentTerm)
+
+	votes := 1 // vote for self
+	var voteMu sync.Mutex
+	// Send RequestVote RPCs to all peers
+	for peerID := range n.peers {
+		if peerID == n.id {
+			continue
+		}
+		go func(peerID string) {
+			// Lazy get client
+			client, err := n.getClient(peerID)
+			if err != nil {
+				log.Printf("[%s] Failed to get client for %s: %v", n.id, peerID, err)
+				return
+			}
+
+			// Retry up to 2 times
+			var resp *pb.RequestVoteResponse
+			var lastErr error
+			maxAttempts := 2
+			for attempt := 0; attempt < maxAttempts; attempt++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+
+				req := &pb.RequestVoteRequest{
+					Term:         currentTerm,
+					CandidateId:  candidateId,
+					LastLogIndex: lastLogIndex,
+					LastLogTerm:  lastLogTerm,
+				}
+				// Send RequestVote RPC
+				resp, lastErr = client.RequestVote(ctx, req)
+				cancel()
+				if lastErr == nil {
+					break // Success
+				}
+
+				if attempt == 0 {
+					log.Printf("[%s] RequestVote to %s failed (attempt %d): %v, retrying...",
+						n.id, peerID, attempt+1, lastErr)
+					time.Sleep(50 * time.Millisecond)
+				}
+			}
+
+			if lastErr != nil {
+				log.Printf("[%s] RequestVote to %s failed after %d attempts: %v",
+					n.id, peerID, maxAttempts, lastErr)
+				return // <- FIX: Return before accessing resp
+			}
+
+			// CRITICAL: Double-check resp is not nil (defensive programming)
+			if resp == nil {
+				log.Printf("[%s] RequestVote to %s returned nil response", n.id, peerID)
+				return
+			}
+
+			n.mu.Lock()
+			defer n.mu.Unlock()
+
+			// Check if term is outdated
+			if resp.Term > n.currentTerm {
+				log.Printf("[%s] Received higher term %d from %s, stepping down",
+					n.id, resp.Term, peerID)
+				n.currentTerm = resp.Term
+				n.votedFor = ""
+				n.state = Follower
+				n.leaderID = ""
+				if n.heartbeatTimer != nil {
+					n.heartbeatTimer.Stop()
+				}
+				n.becomeFollower(resp.Term)
+				log.Printf("[%s] Became FOLLOWER at term %d", n.id, n.currentTerm)
+				return
+			}
+
+			// Count votes
+			if resp.VoteGranted && n.state == Candidate && n.currentTerm == currentTerm {
+				voteMu.Lock()
+				votes++
+				currentVotes := votes
+				voteMu.Unlock()
+
+				log.Printf("[%s] Received vote from %s (%d/%d)", n.id, peerID, currentVotes, len(n.peers))
+
+				// Check if won the election
+				if currentVotes >= len(n.peers)/2 && n.state == Candidate { // majority
+					n.becomeLeader()
+				}
+			}
+		}(peerID)
+	}
+
+	// Reset election timer
+	n.mu.Lock()
+	n.resetElectionTimer()
+	n.mu.Unlock()
+}

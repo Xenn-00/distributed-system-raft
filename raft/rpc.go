@@ -341,7 +341,7 @@ func (n *Node) InstallSnapshot(ctx context.Context, req *pb.InstallSnapshotReque
 
 	// Save new log
 	if len(newLog) > 0 {
-		if err := n.storage.AppendLogs(newLog); err != nil {
+		if err := n.storage.AppendLogBatch(newLog); err != nil {
 			log.Printf("[%s] Failed to save logs: %v", n.id, err)
 		}
 	}

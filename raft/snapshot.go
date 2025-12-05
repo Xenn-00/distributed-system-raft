@@ -126,7 +126,7 @@ func (n *Node) createSnapshot() error {
 
 	// Save new log to disk
 	if len(newLog) > 0 {
-		if err := n.storage.AppendLogs(newLog); err != nil {
+		if err := n.storage.AppendLogBatch(newLog); err != nil {
 			log.Printf("[%s] Failed to save new logs: %v", n.id, err)
 		}
 	}

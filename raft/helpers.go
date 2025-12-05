@@ -25,6 +25,7 @@ func (n *Node) GetLogSize() int {
 	return len(n.log)
 }
 
+// getLastLogIndex returns the index of the last log entry
 func (n *Node) getLastLogIndex() uint64 {
 	if len(n.log) > 0 {
 		return n.log[len(n.log)-1].Index
@@ -39,6 +40,7 @@ func (n *Node) getLastLogIndex() uint64 {
 	return 0
 }
 
+// getLastLogTerm returns the term of the last log entry
 func (n *Node) getLastLogTerm() uint64 {
 	// Check log first
 	if len(n.log) > 0 {
@@ -52,6 +54,43 @@ func (n *Node) getLastLogTerm() uint64 {
 	}
 
 	return 0 // <- No log and no snapshot
+}
+
+// getLogTermAtIndex returns the term of the log entry at the given index (0 if not found)
+func (n *Node) getLogTermAtIndex(index uint64) uint64 {
+	// Check snapshot first
+	if n.storage.HasSnapshot() {
+		snapIndex, snapTerm, _, _ := n.storage.LoadSnapshot()
+		if index == snapIndex {
+			return snapTerm
+		}
+		if index < snapIndex {
+			return 0 // Too old, not available
+		}
+	}
+
+	// Check log
+	for _, entry := range n.log {
+		if entry.Index == index {
+			return entry.Term
+		}
+	}
+
+	return 0 // Not found
+}
+
+// getFirstLogIndex returns the index of the first log entry (or snapshot index + 1)
+func (n *Node) getFirstLogIndex() uint64 {
+	if len(n.log) > 0 {
+		return n.log[0].Index
+	}
+
+	if n.storage.HasSnapshot() {
+		snapIndex, _, _, _ := n.storage.LoadSnapshot()
+		return snapIndex + 1
+	}
+
+	return 1
 }
 
 // GetKvStore returns the KV store (for client queries)

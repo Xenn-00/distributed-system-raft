@@ -7,6 +7,7 @@ import (
 
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
 	"github.com/dgraph-io/badger/v4"
+	"google.golang.org/protobuf/proto"
 )
 
 // Key prefixes, all in bytes because all KV db like BadgerDB, LevelDB, RocksDB etc only store bytes
@@ -96,24 +97,25 @@ func (s *BadgerStorage) LoadVote() (string, error) {
 func (s *BadgerStorage) AppendLog(entry *pb.LogEntry) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		key := logKey(entry.Index)
-		val, err := json.Marshal(entry)
+		data, err := json.Marshal(entry)
 		if err != nil {
 			return err
 		}
 
-		return txn.Set(key, val)
+		return txn.Set(key, data)
 	})
 }
 
-func (s *BadgerStorage) AppendLogs(entries []*pb.LogEntry) error {
+// AppendLogBatch appends multile log entries atomically
+func (s *BadgerStorage) AppendLogBatch(entries []*pb.LogEntry) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		for _, entry := range entries {
 			key := logKey(entry.Index)
-			val, err := json.Marshal(entry)
+			data, err := proto.Marshal(entry)
 			if err != nil {
 				return err
 			}
-			if err := txn.Set(key, val); err != nil {
+			if err := txn.Set(key, data); err != nil {
 				return err
 			}
 		}
