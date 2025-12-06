@@ -41,7 +41,7 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 		lastSnapshotTime:    time.Now(),
 		lastSnapshotIndex:   0,
 		proposalQueue:       make(chan *proposalRequest, 200), // Max 200 queued
-		ProposalSem:         make(chan struct{}, 100),         // Max 100 in-flight
+		ProposalSem:         make(chan struct{}, 500),         // Max 500 in-flight
 		proposalStop:        make(chan struct{}),
 		replicationQueue:    make(chan string, 128), // Buffer 128 tasks
 		replicationStop:     make(chan struct{}),

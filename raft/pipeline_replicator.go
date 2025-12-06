@@ -61,7 +61,21 @@ func (pr *PeerReplicator) start() {
 // stop gracefully shutdown the replicator
 func (pr *PeerReplicator) stop() {
 	close(pr.stopCh)
-	pr.wg.Wait()
+
+	// Wait with timeout (prevent infinite hang)
+	done := make(chan struct{})
+	go func() {
+		pr.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Clean shutdown
+	case <-time.After(5 * time.Second):
+		// Force shutdown after timeout
+		log.Printf("[%s] WARNING: Replicator for %s did not stop gracefully after 5s", pr.node.id, pr.peerID)
+	}
 }
 
 // sendLoop continously sends AppendEntries RPCs
@@ -183,9 +197,14 @@ func (pr *PeerReplicator) receiveLoop() {
 					err: context.DeadlineExceeded,
 				})
 			case <-pr.stopCh:
+				// Shutdown requested, drain this task then exit
+				log.Printf("[%s] Replicator for %s stopping (draining task)",
+					pr.node.id, pr.peerID)
 				return
 			}
 		case <-pr.stopCh:
+			// Shutdown requested
+			log.Printf("[%s] Replicator for %s stopped", pr.node.id, pr.peerID)
 			return
 		}
 	}
@@ -194,22 +213,36 @@ func (pr *PeerReplicator) receiveLoop() {
 // handleResponse processes a single RPC response
 func (pr *PeerReplicator) handleResponse(task *replicationTask, resp *replicationResponse) {
 	pr.node.mu.Lock()
-	defer pr.node.mu.Unlock()
-
 	// Check if still leader
 	if pr.node.state != Leader {
+		pr.node.mu.Unlock()
 		return
 	}
+	pr.node.mu.Unlock()
 
 	// Handle higher term
 	if resp.higherTerm > 0 {
-		pr.node.handleHigherTerm(resp.higherTerm)
+		pr.node.mu.Lock()
+
+		log.Printf("[%s] Stepping down: received higher term %d", pr.node.id, resp.higherTerm)
+		pr.node.currentTerm = resp.higherTerm
+		pr.node.votedFor = ""
+		pr.node.leaderID = ""
+		pr.node.storage.SaveTerm(pr.node.currentTerm)
+		pr.node.storage.SaveVote(pr.node.votedFor)
+
+		// Unlock before calling becomeFollower
+		pr.node.mu.Unlock()
+		pr.node.becomeFollower(resp.higherTerm)
 		return
 	}
 
+	pr.node.mu.Lock()
+	defer pr.node.mu.Unlock()
 	// Handle error
 	if resp.err != nil {
-		pr.node.recordReplicationFailure(pr.peerID, len(task.req.Entries) > 0)
+		pr.node.replicationFailures[pr.peerID]++
+		pr.node.lastFailureTime[pr.peerID] = time.Now()
 		return
 	}
 
@@ -257,14 +290,24 @@ func (np *Node) StartPipelinedReplication() {
 
 // stopPipelinedReplication shutdown all replications
 func (np *Node) StopPipelinedReplication() {
+	// Lock only to read/clear replicators map
 	np.replicatorsMu.Lock()
-	defer np.replicatorsMu.Unlock()
 
+	replicatorsCopy := make([]*PeerReplicator, 0, len(np.replicators))
 	for _, replicator := range np.replicators {
+		replicatorsCopy = append(replicatorsCopy, replicator)
+	}
+
+	// Clear map immediately
+	np.replicators = make(map[string]*PeerReplicator)
+	np.replicatorsMu.Unlock()
+
+	// Stop all replicators without holding any locks
+	for _, replicator := range replicatorsCopy {
 		replicator.stop()
 	}
 
-	np.replicators = make(map[string]*PeerReplicator)
+	log.Printf("[%s] Stopped pipelined replication", np.id)
 }
 
 // Modified becomeLeader to start pipelined replication

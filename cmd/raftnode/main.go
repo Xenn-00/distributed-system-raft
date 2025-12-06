@@ -7,8 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -33,6 +37,28 @@ func main() {
 	}
 
 	log.Printf("Starting Raft node: %s at %s (data: %s)", *nodeID, *address, *dataDir)
+
+	myAddr, ok := peers[*nodeID]
+	if !ok {
+		log.Fatalf("Unknown node ID: %s", *nodeID)
+	}
+
+	host, portStr, err := net.SplitHostPort(myAddr)
+	if err != nil {
+		log.Fatalf("Invalid address format: %v", err)
+	}
+
+	portInt, _ := strconv.Atoi(portStr)
+	pprofPort := portInt + 2000
+
+	pprofAddr := fmt.Sprintf("%s:%d", host, pprofPort)
+
+	go func() {
+		log.Printf("[PPROF] %s is running at http://%s/debug/pprof", *nodeID, pprofAddr)
+		if err := http.ListenAndServe(pprofAddr, nil); err != nil {
+			log.Printf("Failed to start pprof: %v", err)
+		}
+	}()
 
 	// Create Raft node
 	node, err := raft.NewNode(*nodeID, peers, *dataDir)

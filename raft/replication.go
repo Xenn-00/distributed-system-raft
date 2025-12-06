@@ -11,7 +11,7 @@ import (
 func (n *Node) startReplicationWorkers() {
 	// Start 25 workers (12 per peer for 2 peers)
 	// This limits concurrent replication goroutines
-	numWorkers := 15
+	numWorkers := 25
 
 	log.Printf("[%s] Starting %d replication workers", n.id, numWorkers)
 
@@ -128,7 +128,16 @@ func (n *Node) replicateToPeer(peerID string) {
 
 	// Handle higher term
 	if higherTerm > 0 {
-		n.handleHigherTerm(higherTerm)
+		log.Printf("[%s] Stepping down: received higher term %d", n.id, higherTerm)
+		n.currentTerm = higherTerm
+		n.votedFor = ""
+		n.leaderID = ""
+		n.storage.SaveTerm(n.currentTerm)
+		n.storage.SaveVote(n.votedFor)
+
+		// Unlock before calling becomeFollower
+		n.mu.Unlock()
+		n.becomeFollower(higherTerm)
 		return
 	}
 
@@ -221,17 +230,6 @@ func (n *Node) handleFailedReplication(peerID string) {
 				n.id, peerID, n.nextIndex[peerID])
 		}
 	}
-}
-
-// handleHigherTerm steps down when receiving a higher term
-func (n *Node) handleHigherTerm(higherTerm uint64) {
-	log.Printf("[%s] Stepping down: received higher term %d", n.id, higherTerm)
-	n.currentTerm = higherTerm
-	n.votedFor = ""
-	n.leaderID = ""
-	n.storage.SaveTerm(n.currentTerm)
-	n.storage.SaveVote(n.votedFor)
-	n.becomeFollower(higherTerm)
 }
 
 // recordReplicationFailure tracks consecutive failures for rate limiting
