@@ -137,7 +137,8 @@ func (n *Node) replicateToPeer(peerID string) {
 
 		// Unlock before calling becomeFollower
 		n.mu.Unlock()
-		n.becomeFollower(higherTerm)
+		// n.becomeFollower(higherTerm)
+		n.BecomeFollowerWithPipelining(higherTerm)
 		return
 	}
 

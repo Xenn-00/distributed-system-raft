@@ -233,7 +233,7 @@ func (pr *PeerReplicator) handleResponse(task *replicationTask, resp *replicatio
 
 		// Unlock before calling becomeFollower
 		pr.node.mu.Unlock()
-		pr.node.becomeFollower(resp.higherTerm)
+		pr.node.BecomeFollowerWithPipelining(resp.higherTerm)
 		return
 	}
 
@@ -312,6 +312,18 @@ func (np *Node) StopPipelinedReplication() {
 
 // Modified becomeLeader to start pipelined replication
 func (np *Node) BecomeLeaderWithPipelining() {
+	// Stop old resources before acquiring lock
+	np.StopPipelinedReplication()
+	np.stopHeartbeat()
+
+	np.mu.Lock()
+	// Double-check still candidate (might have stepped down)
+	if np.state != Candidate {
+		np.mu.Unlock()
+		log.Printf("[%s] Not candidate anymore, aborting becomeLeader", np.id)
+		return
+	}
+
 	// Caller should hold Lock
 	np.state = Leader
 	np.leaderID = np.id
@@ -330,21 +342,23 @@ func (np *Node) BecomeLeaderWithPipelining() {
 	if np.electionTimer != nil {
 		np.electionTimer.Stop()
 	}
+	np.heartbeatStop = make(chan struct{})
 	np.heartbeatTimer = time.NewTicker(HeartbeatInterval)
 	log.Printf("[%s] Became LEADER at term %d (pipelined mode)", np.id, np.currentTerm)
 	np.mu.Unlock()
 
 	// Start pipelimed replication
-	np.StartPipelinedReplication()
-
+	go np.StartPipelinedReplication()
 	go np.sendHeartbeats()
 }
 
 // Modified becomeFollower to stop replication
 func (np *Node) BecomeFollowerWithPipelining(term uint64) {
+	log.Printf("[%s] Transitioning to FOLLOWER (term %d)", np.id, term)
 	np.StopPipelinedReplication()
+	// stop heartbeat goroutine
+	np.stopHeartbeat()
 
-	// np.mu.Lock()
 	if term > 0 {
 		np.currentTerm = term
 		np.votedFor = ""
@@ -359,7 +373,22 @@ func (np *Node) BecomeFollowerWithPipelining(term uint64) {
 	}
 
 	np.resetElectionTimer()
-	np.mu.Unlock()
 
 	log.Printf("[%s] Became FOLLOWER at term %d", np.id, np.currentTerm)
+}
+
+// stopHeartBeat safely stops the heartbeat goroutine
+func (np *Node) stopHeartbeat() {
+	// Close heartbeat channel to signal goroutine to stop
+	select {
+	case np.heartbeatStop <- struct{}{}:
+		// Signal sent successfully
+	default:
+		// Channel might be full or already closed
+	}
+
+	if np.heartbeatTimer != nil {
+		np.heartbeatTimer.Stop()
+		np.heartbeatTimer = nil
+	}
 }

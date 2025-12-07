@@ -53,6 +53,10 @@ func (n *Node) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 				n.heartbeatTimer.Stop()
 				n.heartbeatTimer = nil
 			}
+			if n.heartbeatStop != nil {
+				close(n.heartbeatStop)
+				n.heartbeatStop = nil
+			}
 		}
 
 		n.storage.SaveTerm(n.currentTerm)

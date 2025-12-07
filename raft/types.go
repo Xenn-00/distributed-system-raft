@@ -36,6 +36,7 @@ type Node struct {
 	// Channels
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Ticker
+	heartbeatStop  chan struct{}
 	shutdownCh     chan struct{}
 
 	// gRPC clients

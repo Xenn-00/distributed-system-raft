@@ -41,10 +41,11 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 		lastSnapshotTime:    time.Now(),
 		lastSnapshotIndex:   0,
 		proposalQueue:       make(chan *proposalRequest, 200), // Max 200 queued
-		ProposalSem:         make(chan struct{}, 500),         // Max 500 in-flight
+		ProposalSem:         make(chan struct{}, 200),         // Max 200 in-flight
 		proposalStop:        make(chan struct{}),
 		replicationQueue:    make(chan string, 128), // Buffer 128 tasks
 		replicationStop:     make(chan struct{}),
+		heartbeatStop:       make(chan struct{}),
 		replicationFailures: make(map[string]int),
 		replicators:         make(map[string]*PeerReplicator),
 		lastFailureTime:     make(map[string]time.Time),

@@ -132,6 +132,19 @@ func (n *Node) flushBatch(batch *proposalBatch) {
 	// Wait for each entry to commit individually
 	for i, req := range batch.requests {
 		entry := batch.entries[i]
-		go n.waitAndRespond(req, entry.Index, term)
+
+		// reuse existing semaphore to limit goroutines
+		select {
+		case n.ProposalSem <- struct{}{}:
+			go func(r *proposalRequest, idx uint64) {
+				defer func() {
+					<-n.ProposalSem
+				}()
+				n.waitAndRespond(r, idx, term)
+			}(req, entry.Index)
+		default:
+			// semaphore full, wait synchronously
+			n.waitAndRespond(req, entry.Index, term)
+		}
 	}
 }

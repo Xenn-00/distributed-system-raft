@@ -112,9 +112,9 @@ func (n *Node) startElection() {
 	n.becomeCandidate() // Transition to candidate state
 	// Prepare RequestVote RPC parameters
 	n.mu.Lock()
+
 	currentTerm := n.currentTerm
 	candidateId := n.id
-
 	// Get last log info (handles snapshot automatically)
 	lastLogIndex := n.getLastLogIndex() // collecting log info from last log entry
 	lastLogTerm := n.getLastLogTerm()   // collecting term info from last log entry
@@ -133,84 +133,29 @@ func (n *Node) startElection() {
 			continue
 		}
 		go func(peerID string) {
-			// Lazy get client
-			client, err := n.getClient(peerID)
-			if err != nil {
-				log.Printf("[%s] Failed to get client for %s: %v", n.id, peerID, err)
+			voteGranted := n.requestVoteFromPeer(peerID, currentTerm, candidateId, lastLogIndex, lastLogTerm)
+
+			if !voteGranted {
 				return
 			}
 
-			// Retry up to 2 times
-			var resp *pb.RequestVoteResponse
-			var lastErr error
-			maxAttempts := 2
-			for attempt := 0; attempt < maxAttempts; attempt++ {
-				ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			// Lock only for vote counting
+			voteMu.Lock()
+			votes++
+			currentVotes := votes
+			voteMu.Unlock()
 
-				req := &pb.RequestVoteRequest{
-					Term:         currentTerm,
-					CandidateId:  candidateId,
-					LastLogIndex: lastLogIndex,
-					LastLogTerm:  lastLogTerm,
-				}
-				// Send RequestVote RPC
-				resp, lastErr = client.RequestVote(ctx, req)
-				cancel()
-				if lastErr == nil {
-					break // Success
-				}
+			log.Printf("[%s] Received vote from %s (%d/%d)", n.id, peerID, currentVotes, len(n.peers))
 
-				if attempt == 0 {
-					log.Printf("[%s] RequestVote to %s failed (attempt %d): %v, retrying...",
-						n.id, peerID, attempt+1, lastErr)
-					time.Sleep(50 * time.Millisecond)
-				}
-			}
-
-			if lastErr != nil {
-				log.Printf("[%s] RequestVote to %s failed after %d attempts: %v",
-					n.id, peerID, maxAttempts, lastErr)
-				return // <- FIX: Return before accessing resp
-			}
-
-			// CRITICAL: Double-check resp is not nil (defensive programming)
-			if resp == nil {
-				log.Printf("[%s] RequestVote to %s returned nil response", n.id, peerID)
-				return
-			}
-
+			// Lock separately for state check
 			n.mu.Lock()
-			defer n.mu.Unlock()
+			majority := len(n.peers)/2 + 1
+			shouldBecomeLeader := currentVotes >= majority && n.state == Candidate && n.currentTerm == currentTerm
+			n.mu.Unlock()
 
-			// Check if term is outdated
-			if resp.Term > n.currentTerm {
-				log.Printf("[%s] Received higher term %d from %s, stepping down",
-					n.id, resp.Term, peerID)
-				n.currentTerm = resp.Term
-				n.votedFor = ""
-				n.state = Follower
-				n.leaderID = ""
-				if n.heartbeatTimer != nil {
-					n.heartbeatTimer.Stop()
-				}
-				n.becomeFollower(resp.Term)
-				log.Printf("[%s] Became FOLLOWER at term %d", n.id, n.currentTerm)
-				return
-			}
-
-			// Count votes
-			if resp.VoteGranted && n.state == Candidate && n.currentTerm == currentTerm {
-				voteMu.Lock()
-				votes++
-				currentVotes := votes
-				voteMu.Unlock()
-
-				log.Printf("[%s] Received vote from %s (%d/%d)", n.id, peerID, currentVotes, len(n.peers))
-
-				// Check if won the election
-				if currentVotes >= len(n.peers)/2 && n.state == Candidate { // majority
-					n.becomeLeader()
-				}
+			// Call becomeLeaderWithPipeling without holding lock
+			if shouldBecomeLeader {
+				n.BecomeLeaderWithPipelining()
 			}
 		}(peerID)
 	}
@@ -219,4 +164,80 @@ func (n *Node) startElection() {
 	n.mu.Lock()
 	n.resetElectionTimer()
 	n.mu.Unlock()
+}
+
+// requestVoteFromPeer seperating logic for better debugging
+func (n *Node) requestVoteFromPeer(peerID string, term uint64, candidateID string, lastLogIndex, lastLogTerm uint64) bool {
+	client, err := n.getClient(peerID)
+	if err != nil {
+		log.Printf("[%s] Failed to get client for %s: %v", n.id, peerID, err)
+		return false
+	}
+
+	// Retry up to 2 times
+	var resp *pb.RequestVoteResponse
+	var lastErr error
+	maxAttempts := 2
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+
+		req := &pb.RequestVoteRequest{
+			Term:         term,
+			CandidateId:  candidateID,
+			LastLogIndex: lastLogIndex,
+			LastLogTerm:  lastLogTerm,
+		}
+
+		resp, lastErr = client.RequestVote(ctx, req)
+		cancel()
+
+		if lastErr == nil {
+			break
+		}
+
+		if attempt == 0 {
+			log.Printf("[%s] RequestVote to %s failed (attempt %d): %v, retrying...",
+				n.id, peerID, attempt+1, lastErr)
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	if lastErr != nil {
+		log.Printf("[%s] RequestVote to %s failed after %d attempts: %v",
+			n.id, peerID, maxAttempts, lastErr)
+		return false
+	}
+
+	if resp == nil {
+		log.Printf("[%s] RequestVote to %s returned nil response", n.id, peerID)
+		return false
+	}
+
+	// Lock for state update
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// Check if received higher term
+	if resp.Term > n.currentTerm {
+		log.Printf("[%s] Received higher term %d from %s, stepping down",
+			n.id, resp.Term, peerID)
+
+		n.currentTerm = resp.Term
+		n.votedFor = ""
+		n.leaderID = ""
+		n.storage.SaveTerm(n.currentTerm)
+		n.storage.SaveVote(n.votedFor)
+
+		// CRITICAL: Unlock BEFORE calling becomeFollower!
+		n.mu.Unlock()
+		n.BecomeFollowerWithPipelining(resp.Term)
+
+		// Re-lock to satisfy defer (will immediately unlock)
+		n.mu.Lock()
+		return false
+	}
+
+	// Return vote result
+	return resp.VoteGranted && n.state == Candidate && n.currentTerm == term
 }
