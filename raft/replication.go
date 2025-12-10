@@ -8,6 +8,7 @@ import (
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
 )
 
+// Deprecated - from now instantly using repliation pipeline instead of worker
 func (n *Node) startReplicationWorkers() {
 	// Start 25 workers (12 per peer for 2 peers)
 	// This limits concurrent replication goroutines
@@ -36,6 +37,43 @@ func (n *Node) replicationWorkers(workerID int) {
 	}
 }
 
+// replicationCoordinator runs as single goroutine
+func (n *Node) replicationCoordinator() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-n.replicationSignal:
+			// Signal received, do replication
+			n.replicateToAll()
+		case <-ticker.C:
+			// Periodic check (fallback)
+			n.mu.Lock()
+			isLeader := n.state == Leader
+			n.mu.Unlock()
+
+			if isLeader {
+				n.replicateToAll()
+			}
+
+		case <-n.shutdownCh:
+			log.Printf("[%s] Replication coordinator stopping", n.id)
+			return
+		}
+	}
+}
+
+// triggerReplication an helper to trigger replication (non-blocking)
+func (n *Node) triggerReplication() {
+	select {
+	case n.replicationSignal <- struct{}{}:
+		// signal sent
+	default:
+		// already signaled
+	}
+}
+
 // replicateToAll sends AppendEntries to all followers
 func (n *Node) replicateToAll() {
 	n.mu.Lock()
@@ -44,19 +82,47 @@ func (n *Node) replicateToAll() {
 		return
 	}
 
+	// Check if using pipelined replication
+	n.replicatorsMu.RLock()
+	hasPipeline := len(n.replicators) > 0
+	n.replicatorsMu.RUnlock()
+
+	// Sample logging: every 10th heartbeat
+	n.heartbeatCount++
+	sLog := shouldLog(n.heartbeatCount, 10)
+	// if sLog {
+	// 	log.Printf("[%s] Heartbeat #%d sent to %d peers (pipeline=%v)", n.id, n.heartbeatCount, len(n.peers)-1, hasPipeline)
+	// }
+	n.mu.Unlock()
+
+	if hasPipeline {
+		// Verify pipeline is healthy
+		n.lastHeartbeatAckMu.Lock()
+		stalePeers := []string{}
+		for peerID := range n.peers {
+			if peerID == n.id {
+				continue
+			}
+			lastAck, ok := n.lastHeartbeatAck[peerID]
+			if !ok || time.Since(lastAck) > 5*HeartbeatInterval {
+				stalePeers = append(stalePeers, peerID)
+			}
+		}
+		n.lastHeartbeatAckMu.Unlock()
+		if len(stalePeers) > 0 && sLog {
+			log.Printf("[%s] WARNING: %d peers haven't acked recently: %v", n.id, len(stalePeers), stalePeers)
+		}
+
+		// Pipeline handles it
+		return
+	}
+
+	// Fallback: direct replication (if pipeline not started)
 	for peerID := range n.peers {
 		if peerID == n.id {
 			continue
 		}
-		// Non-blocking enqueue
-		select {
-		case n.replicationQueue <- peerID:
-			// Task enqueued successfully
-		default:
-			// Queue full, skip (will retry on next heartbeat)
-			// This prevents unbounded goroutine growth
-		}
-		// go n.replicateToPeer(peerID)
+		go n.replicateToPeer(peerID)
 	}
 	n.mu.Unlock()
 }
@@ -185,6 +251,7 @@ func (n *Node) prepareAppendEntriesRequest(nextIdx uint64) *pb.AppendEntriesRequ
 func (n *Node) sendAppendEntries(peerID string, req *pb.AppendEntriesRequest, term uint64) (bool, uint64) {
 	client, err := n.getClient(peerID)
 	if err != nil {
+		log.Printf("[%s] Failed to get client for %s: %v", n.id, peerID, err)
 		n.recordReplicationFailure(peerID, len(req.Entries) > 10)
 		return false, 0
 	}
@@ -192,10 +259,18 @@ func (n *Node) sendAppendEntries(peerID string, req *pb.AppendEntriesRequest, te
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
+	start := time.Now()
 	resp, err := client.AppendEntries(ctx, req)
+	latency := time.Since(start)
 	if err != nil {
+		log.Printf("[%s] AppendEntries to %s FAILED (latency: %v): %v", n.id, peerID, latency, err)
 		n.recordReplicationFailure(peerID, len(req.Entries) > 10)
 		return false, 0
+	}
+
+	// Log slow RPCs
+	if latency > 500*time.Millisecond {
+		log.Printf("[%s] SLOW AppendEntries to %s: %v", n.id, peerID, latency)
 	}
 
 	// Check for higher term
@@ -247,11 +322,16 @@ func (n *Node) recordReplicationFailure(peerID string, shouldLog bool) {
 }
 
 func (n *Node) sendHeartbeats() {
+	defer n.heartbeatRunning.Store(false) // Clear flag
 	for {
 		select {
 		case <-n.heartbeatTimer.C:
-			n.replicateToAll()
+			n.triggerReplication() // instead of call direct n.replicateToAll
+		case <-n.heartbeatStop:
+			log.Printf("[%s] Heartbeat goroutine stopping (heartbeatStop signal)", n.id)
+			return
 		case <-n.shutdownCh:
+			log.Printf("[%s] Heartbeat goroutine stopping (shutdown signal)", n.id)
 			return
 		}
 	}

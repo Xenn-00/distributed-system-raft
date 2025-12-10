@@ -10,6 +10,7 @@ import (
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
 )
 
+// Deprecated: becomeFollower is deprecated. Use BecomeFollowerWithPipelining instead
 func (n *Node) becomeFollower(term uint64) {
 	// n.mu.Lock()
 	// defer n.mu.Unlock()
@@ -57,6 +58,7 @@ func (n *Node) becomeCandidate() {
 	log.Printf("[%s] Became CANDIDATE at term %d", n.id, n.currentTerm)
 }
 
+// Deprecated: becomeLeader is deprecated. Use BecomeLeaderWithPipelining instead
 func (n *Node) becomeLeader() {
 	// Caller should hold n.mu.lock
 
@@ -80,18 +82,6 @@ func (n *Node) becomeLeader() {
 	n.heartbeatTimer = time.NewTicker(HeartbeatInterval)
 
 	log.Printf("[%s] Became LEADER at term %d (lastLogIndex=%d)", n.id, n.currentTerm, lastLogIndex)
-
-	// Send Immediate heartbeat to estabilish authority
-	// go func() {
-	// 	n.mu.Lock()
-	// 	if n.state == Leader {
-	// 		log.Printf("[%s] Sending immediate heartbeat to estabilish leadership", n.id)
-	// 		n.mu.Unlock()
-	// 		n.replicateToAll()
-	// 	} else {
-	// 		n.mu.Unlock()
-	// 	}
-	// }()
 
 	go n.StartPipelinedReplication()
 	// Start sending heartbeats
@@ -118,9 +108,20 @@ func (n *Node) startElection() {
 	// Get last log info (handles snapshot automatically)
 	lastLogIndex := n.getLastLogIndex() // collecting log info from last log entry
 	lastLogTerm := n.getLastLogTerm()   // collecting term info from last log entry
-	// if lastLogIndex > 0 {
-	// 	lastLogTerm = n.log[lastLogIndex-1].Term
-	// }
+
+	if n.consecutiveElectionFailures > 0 {
+		backoff := time.Duration(n.consecutiveElectionFailures) * 200 * time.Millisecond
+		maxBackoff := 2 * time.Second
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+
+		log.Printf("[%s] Election backoff: %v (failures: %d)", n.id, backoff, n.consecutiveElectionFailures)
+		n.mu.Unlock()
+		time.Sleep(backoff)
+		n.mu.Lock()
+	}
+
 	n.mu.Unlock()
 
 	log.Printf("[%s] Starting election for term %d", n.id, currentTerm)
@@ -159,6 +160,19 @@ func (n *Node) startElection() {
 			}
 		}(peerID)
 	}
+
+	// After election, check if won
+	time.AfterFunc(ElectionTimeoutMax, func() {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+
+		if n.state == Candidate && n.currentTerm == currentTerm {
+			// Lost election
+			n.consecutiveElectionFailures++
+			log.Printf("[%s] Election failed (term %d), failures: %d",
+				n.id, currentTerm, n.consecutiveElectionFailures)
+		}
+	})
 
 	// Reset election timer
 	n.mu.Lock()

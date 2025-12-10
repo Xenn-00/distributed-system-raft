@@ -12,7 +12,9 @@ import (
 	"github.com/Xenn-00/distributed-kv-store/kv"
 	"github.com/Xenn-00/distributed-kv-store/storage"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
 func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) {
@@ -23,32 +25,38 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 	}
 
 	node := &Node{
-		id:                  id,
-		state:               Follower,
-		peers:               peers,
-		currentTerm:         0,
-		votedFor:            "",
-		log:                 make([]*pb.LogEntry, 0),
-		commitIndex:         0,
-		lastApplied:         0,
-		leaderID:            "",
-		nextIndex:           make(map[string]uint64),
-		matchIndex:          make(map[string]uint64),
-		shutdownCh:          make(chan struct{}),
-		clients:             make(map[string]pb.RaftClient),
-		kvStore:             kv.NewKVStore(),
-		storage:             stor,
-		lastSnapshotTime:    time.Now(),
-		lastSnapshotIndex:   0,
-		proposalQueue:       make(chan *proposalRequest, 200), // Max 200 queued
-		ProposalSem:         make(chan struct{}, 200),         // Max 200 in-flight
-		proposalStop:        make(chan struct{}),
-		replicationQueue:    make(chan string, 128), // Buffer 128 tasks
-		replicationStop:     make(chan struct{}),
-		heartbeatStop:       make(chan struct{}),
-		replicationFailures: make(map[string]int),
-		replicators:         make(map[string]*PeerReplicator),
-		lastFailureTime:     make(map[string]time.Time),
+		id:                   id,
+		state:                Follower,
+		peers:                peers,
+		currentTerm:          0,
+		votedFor:             "",
+		log:                  make([]*pb.LogEntry, 0),
+		commitIndex:          0,
+		lastApplied:          0,
+		leaderID:             "",
+		nextIndex:            make(map[string]uint64),
+		matchIndex:           make(map[string]uint64),
+		shutdownCh:           make(chan struct{}),
+		clients:              make(map[string]pb.RaftClient),
+		connections:          make(map[string]*grpc.ClientConn),
+		kvStore:              kv.NewKVStore(),
+		storage:              stor,
+		lastSnapshotTime:     time.Now(),
+		lastSnapshotIndex:    0,
+		proposalQueue:        make(chan *proposalRequest, 128), // Max 128 queued
+		ProposalSem:          make(chan struct{}, 128),         // Max 128 in-flight
+		proposalStop:         make(chan struct{}),
+		replicationQueue:     make(chan string, 128), // Buffer 128 tasks
+		replicationSignal:    make(chan struct{}, 1),
+		replicationCoordDone: make(chan struct{}),
+		replicationStop:      make(chan struct{}),
+		heartbeatStop:        make(chan struct{}),
+		applySignal:          make(chan struct{}, 1),
+		applyDone:            make(chan struct{}),
+		lastHeartbeatAck:     make(map[string]time.Time),
+		replicationFailures:  make(map[string]int),
+		replicators:          make(map[string]*PeerReplicator),
+		lastFailureTime:      make(map[string]time.Time),
 	}
 	// Restore from disk
 	if err := node.restoreFromStorage(); err != nil {
@@ -171,16 +179,66 @@ func (n *Node) getClient(peerID string) (pb.RaftClient, error) {
 		return nil, fmt.Errorf("unknown peer ID: %s", peerID)
 	}
 
-	// Create new client
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Create new client, add connection options to prevent leaks
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
+
+		// Add: keepalive to detect dead connections
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                10 * time.Second, // Send ping every 10s
+			Timeout:             3 * time.Second,  // Wait 3s for pong
+			PermitWithoutStream: true,             // Send ping even without active RPCs
+		}),
+
+		// Add: limits to prevent resources exhaustion
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(16*1024*1024), // 16MB
+			grpc.MaxCallSendMsgSize(16*1024*1024), // 16MB
+		),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to peer %s at %s: %v", peerID, addr, err)
 	}
 
 	client = pb.NewRaftClient(conn)
 	n.clients[peerID] = client
+	n.connections[peerID] = conn
 	log.Printf("[%s] Connected to peer %s at %s", n.id, peerID, addr)
 	return client, nil
+}
+
+// Periodically check and close dead connections
+func (n *Node) monitorConnectionHealth() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			n.checkConnectionHealth()
+		case <-n.shutdownCh:
+			return
+		}
+	}
+}
+
+func (n *Node) checkConnectionHealth() {
+	n.clientsMu.Lock()
+	defer n.clientsMu.Unlock()
+
+	for peerID, conn := range n.connections {
+		state := conn.GetState()
+
+		// Close connections in bad state
+		if state == connectivity.TransientFailure || state == connectivity.Shutdown {
+			log.Printf("[%s] Connection to %s in bad state (%s), closing...", n.id, peerID, state)
+
+			conn.Close()
+			delete(n.connections, peerID)
+			delete(n.clients, peerID)
+
+			// Will be recreated on next use
+		}
+	}
 }
 
 func (n *Node) Start() {
@@ -201,12 +259,14 @@ func (n *Node) Start() {
 	n.resetElectionTimer()
 	n.mu.Unlock()
 
-	go n.processProposalWithBatching()
+	go n.monitorConnectionHealth()
 
-	// go n.processProposals()
+	go n.processProposalWithBatching()
+	go n.replicationCoordinator()
+	go n.applyCoordinator()
 
 	// Start replication workers
-	n.startReplicationWorkers()
+	// n.startReplicationWorkers() // using pipelined instead
 	// Start periodic snapshot check
 	go n.periodicSnapshotCheck()
 	go n.reportFailures()
@@ -286,10 +346,43 @@ func (n *Node) Shutdown() {
 		return true
 	})
 
-	// Stop worker pool
+	// Stop worker pool and coordinators
 	close(n.replicationStop)
-
 	close(n.shutdownCh)
+
+	// Wait for coordinators with timeout
+	done := make(chan struct{})
+	go func() {
+		<-n.replicationCoordDone
+		<-n.applyDone
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Printf("[%s] All coordinators stopped cleanly", n.id)
+	case <-time.After(2 * time.Second):
+		log.Printf("[%s] WARNING: Coordinators did not stop in time", n.id)
+	}
+
+	// Stop pipelined replication
+	n.StopPipelinedReplication()
+
+	// Close all gRPC connections
+	n.clientsMu.Lock()
+	log.Printf("[%s] Closing %d gRPC connections...", n.id, len(n.connections))
+	for peerID, conn := range n.connections {
+		if err := conn.Close(); err != nil {
+			log.Printf("[%s] Error closing connection to %s: %v", n.id, peerID, err)
+		} else {
+			log.Printf("[%s] Closed connection to %s", n.id, peerID)
+		}
+	}
+	n.connections = make(map[string]*grpc.ClientConn)
+	n.clients = make(map[string]pb.RaftClient)
+	n.clientsMu.Unlock()
+
+	// Cleanup
 	if n.heartbeatTimer != nil {
 		n.heartbeatTimer.Stop()
 	}

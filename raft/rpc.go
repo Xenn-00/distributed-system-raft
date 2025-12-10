@@ -49,14 +49,8 @@ func (n *Node) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 			log.Printf("[%s] Stepping down from %s to FOLLOWER", n.id, n.state)
 			n.state = Follower
 			n.leaderID = ""
-			if n.heartbeatTimer != nil {
-				n.heartbeatTimer.Stop()
-				n.heartbeatTimer = nil
-			}
-			if n.heartbeatStop != nil {
-				close(n.heartbeatStop)
-				n.heartbeatStop = nil
-			}
+
+			n.safeStopHeartbeat()
 		}
 
 		n.storage.SaveTerm(n.currentTerm)
@@ -103,6 +97,12 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		Success: false,
 	}
 
+	// Log heartbeat receives
+	isHeartbeat := len(req.Entries) == 0
+	// if isHeartbeat {
+	// 	log.Printf("[%s] RECEIVED heartbeat from %s (term=%d, leaderCommit=%d)", n.id, req.LeaderId, req.Term, req.LeaderCommit)
+	// }
+
 	// Reply false if term < currentTerm
 	if req.Term < n.currentTerm {
 		log.Printf("[%s] Rejected AppendEntries from %s: stale term (%d < %d)", n.id, req.LeaderId, req.Term, n.currentTerm)
@@ -137,8 +137,13 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 	// Reset election timer on valid AppendEntries
 	n.resetElectionTimer()
 
+	// // Log timer reset
+	// if isHeartbeat {
+	// 	log.Printf("[%s] Election timer RESET by heartbeat from %s", n.id, req.LeaderId)
+	// }
+
 	// Heartbeat (no entries)
-	if len(req.Entries) == 0 {
+	if isHeartbeat {
 		// Update commitIndex from leader
 		if req.LeaderCommit > n.commitIndex {
 			oldCommit := n.commitIndex
@@ -146,7 +151,7 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 			// Only log if actually changed
 			if n.commitIndex != oldCommit {
 				log.Printf("[%s] Updated commitIndex from %d to %d", n.id, oldCommit, n.commitIndex)
-				go n.applyEntries()
+				n.triggerApply() // use signal instead of spawn go n.applyEntries
 			}
 		}
 
@@ -258,7 +263,7 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		// Only log if actually changed
 		if n.commitIndex != oldCommit {
 			log.Printf("[%s] Updated commitIndex from %d to %d", n.id, oldCommit, n.commitIndex)
-			go n.applyEntries()
+			n.triggerApply() // Use signal instead of spawn go n.applyEntries
 		}
 	}
 

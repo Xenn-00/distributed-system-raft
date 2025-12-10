@@ -87,7 +87,7 @@ func (n *Node) proposeInternal(ctx context.Context, command []byte) (uint64, err
 	n.mu.Unlock()
 
 	// Trigger replication (will happend on next heartbeat or immediate)
-	go n.replicateToAll()
+	n.triggerReplication() // instead of using go n.replicateToAll()
 
 	// Wait for commit before returning
 	if err := n.waitForCommit(ctx, index); err != nil {

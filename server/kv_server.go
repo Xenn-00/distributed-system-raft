@@ -16,7 +16,8 @@ import (
 
 type KVServer struct {
 	pb.UnimplementedKVServer
-	node *raft.Node
+	node       *raft.Node
+	grpcServer *grpc.Server
 }
 
 func NewKVServer(node *raft.Node) *KVServer {
@@ -164,10 +165,10 @@ func (s *KVServer) List(ctx context.Context, req *pb.ListRequest) (*pb.ListRespo
 	return resp, nil
 }
 
-func (s *KVServer) Start(address string) error {
+func (s *KVServer) Start(address string) (*grpc.Server, net.Listener, error) {
 	lis, err := net.Listen("tcp", address)
 	if err != nil {
-		return fmt.Errorf("failed to listen: %v", err)
+		return nil, nil, fmt.Errorf("failed to listen: %v", err)
 	}
 
 	grpcServer := grpc.NewServer(
@@ -179,6 +180,12 @@ func (s *KVServer) Start(address string) error {
 
 		// Limit max message size send
 		grpc.MaxSendMsgSize(4*1024*1024),
+
+		// Keepalive params
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second,
+			PermitWithoutStream: true,
+		}),
 
 		// Set keep alive params
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -193,6 +200,33 @@ func (s *KVServer) Start(address string) error {
 	)
 	pb.RegisterKVServer(grpcServer, s)
 
+	s.grpcServer = grpcServer // Save reference
+
 	log.Printf("gRPC server listening on %s", address)
-	return grpcServer.Serve(lis)
+	return grpcServer, lis, nil
+}
+
+// Graceful shutdown method
+func (s *KVServer) Shutdown() {
+	if s.grpcServer == nil {
+		return
+	}
+
+	log.Printf("[KVServer] Shutting down gracefully...")
+
+	// Graceful stop (waits for ongoing RPCs)
+	done := make(chan struct{})
+	go func() {
+		s.grpcServer.GracefulStop()
+		close(done)
+	}()
+
+	// Timeout if takes too long
+	select {
+	case <-done:
+		log.Printf("[KVServer] Shutdown complete")
+	case <-time.After(5 * time.Second):
+		log.Printf("[KVServer] Forcing shutdown after timeout")
+		s.grpcServer.Stop() // Force stop
+	}
 }

@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Xenn-00/distributed-kv-store/kv"
 )
@@ -244,6 +245,67 @@ func (n *Node) GetLeaderAddress() string {
 	}
 
 	return addr
+}
+
+// safeStopHeartbeat safely stops heartbeat without risk of double close
+func (n *Node) safeStopHeartbeat() {
+	// Stop timer first
+	if n.heartbeatTimer != nil {
+		n.heartbeatTimer.Stop()
+		n.heartbeatTimer = nil
+	}
+	if n.heartbeatStop != nil {
+		// Check if already closed by trying to send (non-blocking)
+		select {
+		case n.heartbeatStop <- struct{}{}:
+			// Successfully sent stop signal
+			log.Printf("[%s] Sent heartbeat stop signal", n.id)
+		default:
+			// Channel full or closed
+			log.Printf("[%s] Hearbeat stop channel already signaled", n.id)
+		}
+	}
+}
+
+// safeCloseChannel safely closes a channel with nil check
+func (n *Node) safeCloseChannel(ch chan struct{}, name string, nodeID string) {
+	if ch == nil {
+		log.Printf("[%s] %s channel is nil, skipping close", nodeID, name)
+		return
+	}
+
+	// Try non-blocking send (signal to stop)
+	select {
+	case ch <- struct{}{}:
+		log.Printf("[%s] Sent stop signal to %s", nodeID, name)
+	default:
+		log.Printf("[%s] %s already signaled or Closed", nodeID, name)
+	}
+}
+
+// safeStopTimer safely stops a timer
+func (n *Node) safeStopTimer(timer *time.Timer, name string, nodeID string) {
+	if timer == nil {
+		return
+	}
+
+	if !timer.Stop() {
+		// Timer already fired, drain channel
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	log.Printf("[%s] Stopped %s timer", nodeID, name)
+}
+
+// safeStopTicker safely stops a ticker
+func (n *Node) safeStopTicker(ticker *time.Ticker, name string, nodeID string) {
+	if ticker == nil {
+		return
+	}
+	ticker.Stop()
+	log.Printf("[%s] Stopped %s ticker", nodeID, name)
 }
 
 func shouldLog(index uint64, sampleRate int) bool {

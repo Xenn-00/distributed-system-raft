@@ -27,7 +27,7 @@ func (s NodeState) String() string {
 // Timeouts and Snapshots
 const (
 	HeartbeatInterval  = 150 * time.Millisecond
-	ElectionTimeoutMin = 1500 * time.Millisecond
+	ElectionTimeoutMin = 1000 * time.Millisecond
 	ElectionTimeoutMax = 3000 * time.Millisecond
 	// Snapshot ever N log entries
 	SnapshotThreshold = 10 // Set low for testing, production could use 10000+

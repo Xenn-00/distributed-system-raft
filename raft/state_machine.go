@@ -48,7 +48,7 @@ func (n *Node) updateCommitIndex() {
 			if shouldLog(N, 10) {
 				log.Printf("[%s] Advancing commitIndex from %d to %d (majority confirmed: %d/%d)", n.id, oldCommit, N, count, len(n.peers))
 			}
-			go n.applyEntries()
+			n.triggerApply() // Use signal instead of spawn go n.applyEntries
 		} else {
 			break // Can't commit higher indices yet
 		}
@@ -100,7 +100,7 @@ func (n *Node) updateCommitIndexWithBatching() {
 	// Notify all waiters in on shot
 	if n.commitIndex > oldCommit {
 		go n.NotifyBatchCommitWaiters(oldCommit, n.commitIndex)
-		go n.applyEntries()
+		n.triggerApply() // Use signal instead of spawn go n.applyEntries
 	}
 }
 
@@ -178,5 +178,33 @@ func (n *Node) applyEntries() {
 			log.Printf("[%s] Applied entry index=%d (lastApplied=%d, commitIndex=%d)", n.id, entryIndex, n.lastApplied, n.commitIndex)
 		}
 		n.mu.Unlock()
+	}
+}
+
+// same with replicationCoordinator, applyCoordinator also runs as single goroutine
+func (n *Node) applyCoordinator() {
+	defer close(n.applyDone)
+
+	log.Printf("[%s] Apply coordinator started", n.id)
+
+	for {
+		select {
+		case <-n.applySignal:
+			// Signal received, apply entries
+			n.applyEntries()
+		case <-n.shutdownCh:
+			log.Printf("[%s] Apply coordinator stopping", n.id)
+			return
+		}
+	}
+}
+
+// triggerApply an helper to trigger apply entries (non-blocking)
+func (n *Node) triggerApply() {
+	select {
+	case n.applySignal <- struct{}{}:
+		// Signal sent
+	default:
+		// Already signaled, perfect!
 	}
 }

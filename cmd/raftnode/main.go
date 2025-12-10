@@ -12,6 +12,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/Xenn-00/distributed-kv-store/raft"
 	"github.com/Xenn-00/distributed-kv-store/server"
+	"google.golang.org/grpc"
 )
 
 func main() {
@@ -53,6 +55,7 @@ func main() {
 
 	pprofAddr := fmt.Sprintf("%s:%d", host, pprofPort)
 
+	// Start pprof server
 	go func() {
 		log.Printf("[PPROF] %s is running at http://%s/debug/pprof", *nodeID, pprofAddr)
 		if err := http.ListenAndServe(pprofAddr, nil); err != nil {
@@ -69,18 +72,37 @@ func main() {
 
 	// Start gRPC server
 	raftServer := server.NewRaftServer(node)
+	raftGrpcServer, raftListener, err := raftServer.Start(*address)
+	if err != nil {
+		log.Fatalf("Failed to start Raft server: %v", err)
+	}
+
+	// Serve in goroutine
 	go func() {
-		if err := raftServer.Start(*address); err != nil {
-			log.Fatalf("Failed to start server: %v", err)
+		log.Printf("Raft gRPC server starting on %s", *address)
+		if err := raftGrpcServer.Serve(raftListener); err != nil {
+			log.Printf("Raft server stopped: %v", err)
 		}
 	}()
 
+	// Monitor goroutines
+	go monitorGoroutines(*nodeID)
+
 	// Start KV server (client-facing) if address provided
+	var kvServer *server.KVServer
+	var kvGrpcServer *grpc.Server
+	var kvListener net.Listener
+
 	if *kvAddr != "" {
-		kvServer := server.NewKVServer(node)
+		kvServer = server.NewKVServer(node)
+		kvGrpcServer, kvListener, err = kvServer.Start(*kvAddr)
+		if err != nil {
+			log.Fatalf("Failed to start KV server: %v", err)
+		}
+
 		go func() {
 			log.Printf("Starting KV API server at %s", *kvAddr)
-			if err := kvServer.Start(*kvAddr); err != nil {
+			if err := kvGrpcServer.Serve(kvListener); err != nil {
 				log.Fatalf("Failed to start KV server: %v", err)
 			}
 		}()
@@ -94,8 +116,56 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	log.Println("Shutting down...")
+	// Graceful shutdown in proper order
+	log.Printf("[%s] Stopping gRPC servers...", *nodeID)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Stop server gracefully
+	stopped := make(chan struct{})
+	go func() {
+		// Stop Raft server
+		if raftServer != nil {
+			raftServer.Shutdown()
+		}
+
+		if kvServer != nil {
+			kvServer.Shutdown()
+		}
+
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+		log.Printf("[%s] gRPC servers stopped gracefully", *nodeID)
+	case <-shutdownCtx.Done():
+		log.Printf("[%s] WARNING: Server shutdown timeout, forcing stop", *nodeID)
+		if raftGrpcServer != nil {
+			raftGrpcServer.Stop() // force stop
+		}
+		if kvGrpcServer != nil {
+			kvGrpcServer.Stop() // force stop
+		}
+	}
+
+	// Stop Raftnode
+	log.Printf("[%s] Stopping Raft node...", *nodeID)
 	node.Shutdown()
+
+	// Final goroutine check
+	time.Sleep(500 * time.Millisecond)
+	finalCount := runtime.NumGoroutine()
+	log.Printf("[%s] Shutdown complete. Final goroutine count: %d", *nodeID, finalCount)
+
+	if finalCount > 10 {
+		log.Printf("[%s] WARNING: %d goroutines still running (expected < 10)", *nodeID, finalCount)
+
+		// Dump goroutines for debugging
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		log.Printf("[%s] Goroutine dump:\n%s", *nodeID, buf[:n])
+	}
 }
 
 func startCLI(node *raft.Node, nodeID string) {
@@ -109,6 +179,7 @@ func startCLI(node *raft.Node, nodeID string) {
 	fmt.Println("  del <key>          - Delete a key")
 	fmt.Println("  list               - List all keys")
 	fmt.Println("  status             - Show node status")
+	fmt.Println("  debug              - Debug runtime stack")
 	fmt.Println("\nNote: This CLI directly accesses Raft layer (for testing only)")
 	fmt.Println("      In production, use KVClient which talks to KVServer")
 
@@ -265,9 +336,72 @@ func startCLI(node *raft.Node, nodeID string) {
 			fmt.Printf("Log Entries: %d\n", logSize)
 			fmt.Printf("Commit Index: %d\n", commitIdx)
 			fmt.Printf("Snapshot: %s\n", snapInfo)
+		case "debug":
+			buf := make([]byte, 1<<20)
+			n := runtime.Stack(buf, true)
+			stacks := string(buf[:n])
+
+			counts := make(map[string]int)
+
+			// Count patterns
+			patterns := map[string]string{
+				"grpc_server":   "google.golang.org/grpc/internal/transport.(*http2Server)",
+				"grpc_client":   "google.golang.org/grpc/internal/transport.(*http2Client)",
+				"badger":        "github.com/dgraph-io/badger",
+				"raft_pipeline": "github.com/Xenn-00/distributed-kv-store/raft.(*PeerReplicator)",
+				"raft_other":    "github.com/Xenn-00/distributed-kv-store/raft",
+			}
+
+			for name, pattern := range patterns {
+				counts[name] = strings.Count(stacks, pattern)
+			}
+
+			fmt.Printf("=== Goroutine Analysis ===\n")
+			fmt.Printf("Total: %d\n", runtime.NumGoroutine())
+			for name, count := range counts {
+				fmt.Printf("  %s: ~%d\n", name, count)
+			}
 
 		default:
 			fmt.Println("Unknown command.")
 		}
+	}
+}
+
+// Monitor goroutines periodically
+func monitorGoroutines(nodeID string) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	lastCount := 0
+
+	for range ticker.C {
+		count := runtime.NumGoroutine()
+		delta := count - lastCount
+
+		if delta > 0 {
+			log.Printf("[%s] Goroutines: %d (+%d)", nodeID, count, delta)
+		} else if delta < 0 {
+			log.Printf("[%s] Goroutines: %d (%d)", nodeID, count, delta)
+		} else {
+			log.Printf("[%s] Goroutines: %d (stable)", nodeID, count)
+		}
+
+		if count > 500 {
+			log.Printf("[%s] ⚠️  WARNING: High goroutine count (%d)!", nodeID, count)
+		}
+
+		if count > 5000 {
+			log.Printf("[%s] 🔥 CRITICAL: Goroutine leak detected (%d)!", nodeID, count)
+			// Auto-dump for debugging
+			buf := make([]byte, 1<<20)
+			n := runtime.Stack(buf, true)
+
+			filename := fmt.Sprintf("goroutine-leak-%s-%d.txt", nodeID, time.Now().Unix())
+			os.WriteFile(filename, buf[:n], 0644)
+			log.Printf("[%s] Goroutine dump saved to %s", nodeID, filename)
+		}
+
+		lastCount = count
 	}
 }

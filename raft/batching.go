@@ -127,7 +127,7 @@ func (n *Node) flushBatch(batch *proposalBatch) {
 	log.Printf("[%s] Flushed batch of %d entries (index %d-%d)", n.id, len(batch.entries), startIndex, startIndex+uint64(len(batch.entries))-1)
 
 	// Triger replication (all entries will be sent together)
-	go n.replicateToAll()
+	n.triggerReplication() // instead of using go n.replicateToAll()
 
 	// Wait for each entry to commit individually
 	for i, req := range batch.requests {

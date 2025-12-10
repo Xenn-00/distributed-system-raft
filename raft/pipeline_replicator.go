@@ -89,6 +89,7 @@ func (pr *PeerReplicator) sendLoop() {
 		case <-ticker.C:
 			pr.maybeSendBatch()
 		case <-pr.stopCh:
+			log.Printf("[%s] Pipeline sendLoop STOPPING for peer %s", pr.node.id, pr.peerID)
 			return
 		}
 	}
@@ -105,12 +106,12 @@ func (pr *PeerReplicator) maybeSendBatch() {
 
 	// Check if there's work to do
 	nextIdx := pr.node.nextIndex[pr.peerID]
-	lastLogIndex := pr.node.getLastLogIndex()
+	// lastLogIndex := pr.node.getLastLogIndex()
 
-	if nextIdx > lastLogIndex {
-		pr.node.mu.Unlock()
-		return // No new entries
-	}
+	// if nextIdx > lastLogIndex {
+	// 	pr.node.mu.Unlock()
+	// 	return // No new entries
+	// }
 
 	// Check in-flight limit
 	if len(pr.inflightQ) >= MaxInFlightRPCs {
@@ -123,6 +124,13 @@ func (pr *PeerReplicator) maybeSendBatch() {
 	term := pr.node.currentTerm
 
 	pr.node.mu.Unlock()
+
+	// // Log heartbeat sends
+	// if len(req.Entries) == 0 {
+	// 	// This is a heartbeat
+	// 	log.Printf("[%s] Sending heartbeat to %s (term=%d, commitIndex=%d)",
+	// 		pr.node.id, pr.peerID, term, req.LeaderCommit)
+	// }
 
 	// Create task
 	task := &replicationTask{
@@ -183,6 +191,8 @@ func (pr *PeerReplicator) sendRPC(task *replicationTask, term uint64) {
 // receiveLo0p processes responses
 func (pr *PeerReplicator) receiveLoop() {
 	defer pr.wg.Done()
+
+	log.Printf("[%s] Pipeline receiveLoop STARTED for peer %s", pr.node.id, pr.peerID)
 
 	for {
 		select {
@@ -248,6 +258,9 @@ func (pr *PeerReplicator) handleResponse(task *replicationTask, resp *replicatio
 
 	// Handle success
 	if resp.success {
+		pr.node.lastHeartbeatAckMu.Lock()
+		pr.node.lastHeartbeatAck[pr.peerID] = time.Now()
+		pr.node.lastHeartbeatAckMu.Unlock()
 		pr.node.replicationFailures[pr.peerID] = 0
 		delete(pr.node.lastFailureTime, pr.peerID)
 
@@ -314,7 +327,7 @@ func (np *Node) StopPipelinedReplication() {
 func (np *Node) BecomeLeaderWithPipelining() {
 	// Stop old resources before acquiring lock
 	np.StopPipelinedReplication()
-	np.stopHeartbeat()
+	// np.stopHeartbeat()
 
 	np.mu.Lock()
 	// Double-check still candidate (might have stepped down)
@@ -327,6 +340,8 @@ func (np *Node) BecomeLeaderWithPipelining() {
 	// Caller should hold Lock
 	np.state = Leader
 	np.leaderID = np.id
+
+	np.consecutiveElectionFailures = 0 // reset counter
 
 	// initialized leader state
 	lastLogIndex := np.getLastLogIndex()
@@ -342,12 +357,16 @@ func (np *Node) BecomeLeaderWithPipelining() {
 	if np.electionTimer != nil {
 		np.electionTimer.Stop()
 	}
+	// safe cleanup before recreating
+	np.safeStopTimer(np.electionTimer, "election", np.id)
+
 	np.heartbeatStop = make(chan struct{})
 	np.heartbeatTimer = time.NewTicker(HeartbeatInterval)
+	np.heartbeatRunning.Store(true) // Mark as running
 	log.Printf("[%s] Became LEADER at term %d (pipelined mode)", np.id, np.currentTerm)
 	np.mu.Unlock()
 
-	// Start pipelimed replication
+	// Start pipelined replication
 	go np.StartPipelinedReplication()
 	go np.sendHeartbeats()
 }
@@ -367,10 +386,8 @@ func (np *Node) BecomeFollowerWithPipelining(term uint64) {
 	np.state = Follower
 	np.leaderID = ""
 
-	if np.heartbeatTimer != nil {
-		np.heartbeatTimer.Stop()
-		np.heartbeatTimer = nil
-	}
+	// safe cleanup
+	np.safeStopTicker(np.heartbeatTimer, "heartbeat", np.id)
 
 	np.resetElectionTimer()
 
@@ -380,11 +397,18 @@ func (np *Node) BecomeFollowerWithPipelining(term uint64) {
 // stopHeartBeat safely stops the heartbeat goroutine
 func (np *Node) stopHeartbeat() {
 	// Close heartbeat channel to signal goroutine to stop
-	select {
-	case np.heartbeatStop <- struct{}{}:
-		// Signal sent successfully
-	default:
-		// Channel might be full or already closed
+	if np.heartbeatRunning.CompareAndSwap(true, false) {
+		// Successfully transitioned from running to stopped
+		if np.heartbeatStop != nil {
+			select {
+			case np.heartbeatStop <- struct{}{}:
+				log.Printf("[%s] Sent heartbeat stop signal", np.id)
+			case <-time.After(100 * time.Millisecond):
+				log.Printf("[%s] WARNING: heartbeat stop signal timeout", np.id)
+			}
+		}
+	} else {
+		log.Printf("[%s] Heartbeat already stopped", np.id)
 	}
 
 	if np.heartbeatTimer != nil {
