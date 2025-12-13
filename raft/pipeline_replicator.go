@@ -56,6 +56,8 @@ func (pr *PeerReplicator) start() {
 
 	pr.wg.Add(1)
 	go pr.receiveLoop()
+
+	log.Printf("[%s] Started pipeline for peer %s", pr.node.id, pr.peerID)
 }
 
 // stop gracefully shutdown the replicator
@@ -72,6 +74,7 @@ func (pr *PeerReplicator) stop() {
 	select {
 	case <-done:
 		// Clean shutdown
+		log.Printf("[%s] Pipeline for %s stopped clearly", pr.node.id, pr.peerID)
 	case <-time.After(5 * time.Second):
 		// Force shutdown after timeout
 		log.Printf("[%s] WARNING: Replicator for %s did not stop gracefully after 5s", pr.node.id, pr.peerID)
@@ -106,12 +109,6 @@ func (pr *PeerReplicator) maybeSendBatch() {
 
 	// Check if there's work to do
 	nextIdx := pr.node.nextIndex[pr.peerID]
-	// lastLogIndex := pr.node.getLastLogIndex()
-
-	// if nextIdx > lastLogIndex {
-	// 	pr.node.mu.Unlock()
-	// 	return // No new entries
-	// }
 
 	// Check in-flight limit
 	if len(pr.inflightQ) >= MaxInFlightRPCs {
@@ -119,18 +116,30 @@ func (pr *PeerReplicator) maybeSendBatch() {
 		return // Too many in-flight
 	}
 
+	// Check if peer needs snapshot
+	var firstLogIndex uint64 = 1
+	if len(pr.node.log) > 0 {
+		firstLogIndex = pr.node.log[0].Index
+	} else if pr.node.storage.HasSnapshot() {
+		snapIndex, _, _, _ := pr.node.storage.LoadSnapshot()
+		firstLogIndex = snapIndex + 1
+	}
+
+	// Peer too far behind - need snapshot
+	if nextIdx < firstLogIndex {
+		log.Printf("[%s] Peer %s needs snapshot (next=%d, first=%d)", pr.node.id, pr.peerID, nextIdx, firstLogIndex)
+		pr.node.mu.Unlock()
+
+		// Send snapshot in background
+		go pr.node.sendSnapshot(pr.peerID)
+		return
+	}
+
 	// Prepare request
-	req := pr.node.prepareAppendEntriesRequest(nextIdx)
+	req := pr.node.prepareAppendEntriesRequest(nextIdx) // call within lock
 	term := pr.node.currentTerm
 
 	pr.node.mu.Unlock()
-
-	// // Log heartbeat sends
-	// if len(req.Entries) == 0 {
-	// 	// This is a heartbeat
-	// 	log.Printf("[%s] Sending heartbeat to %s (term=%d, commitIndex=%d)",
-	// 		pr.node.id, pr.peerID, term, req.LeaderCommit)
-	// }
 
 	// Create task
 	task := &replicationTask{
@@ -144,7 +153,7 @@ func (pr *PeerReplicator) maybeSendBatch() {
 
 	// Track in-flight
 	select {
-	case pr.inflightQ <- task:
+	case pr.inflightQ <- task: // Successfully queued
 	default:
 		// Queue full (shouldn't happen. but be defensive)
 		log.Printf("[%s] In-flight queue full for %s", pr.node.id, pr.peerID)
@@ -153,38 +162,19 @@ func (pr *PeerReplicator) maybeSendBatch() {
 
 // sendRPC sends the AppendEntries RPC
 func (pr *PeerReplicator) sendRPC(task *replicationTask, term uint64) {
-	client, err := pr.node.getClient(pr.peerID)
-	if err != nil {
-		task.respCh <- &replicationResponse{err: err}
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), RPCTimeout)
-	defer cancel()
-
-	resp, err := client.AppendEntries(ctx, task.req)
-	if err != nil {
-		task.respCh <- &replicationResponse{err: err}
-		return
-	}
-
+	success, higherTerm, err := pr.node.sendAppendEntriesRPC(pr.peerID, task.req, term)
 	// Calculate matchIndex from request
 	var matchIndex uint64
 	if len(task.req.Entries) > 0 {
 		matchIndex = task.req.Entries[len(task.req.Entries)-1].Index
 	}
 
-	// Check for higher term
-	if resp.Term > term {
-		task.respCh <- &replicationResponse{
-			higherTerm: resp.Term,
-		}
-		return
-	}
-
+	// Send response back to receiveLoop
 	task.respCh <- &replicationResponse{
-		success:    resp.Success,
+		success:    success,
 		matchIndex: matchIndex,
+		higherTerm: higherTerm,
+		err:        err,
 	}
 }
 
@@ -250,43 +240,21 @@ func (pr *PeerReplicator) handleResponse(task *replicationTask, resp *replicatio
 	pr.node.mu.Lock()
 	defer pr.node.mu.Unlock()
 	// Handle error
-	if resp.err != nil {
-		pr.node.replicationFailures[pr.peerID]++
-		pr.node.lastFailureTime[pr.peerID] = time.Now()
-		return
-	}
-
+	pr.node.recordReplicationOutcome(pr.peerID, resp.success, resp.err)
 	// Handle success
-	if resp.success {
-		pr.node.lastHeartbeatAckMu.Lock()
-		pr.node.lastHeartbeatAck[pr.peerID] = time.Now()
-		pr.node.lastHeartbeatAckMu.Unlock()
-		pr.node.replicationFailures[pr.peerID] = 0
-		delete(pr.node.lastFailureTime, pr.peerID)
-
-		if resp.matchIndex > 0 {
-			pr.node.matchIndex[pr.peerID] = resp.matchIndex
-			pr.node.nextIndex[pr.peerID] = resp.matchIndex + 1
-
-			latency := time.Since(task.sentAt)
-			if shouldLog(resp.matchIndex, 10) {
-				log.Printf("[%s] Peer %s replicate up to %d (latency: %v)", pr.node.id, pr.peerID, resp.matchIndex, latency)
-			}
-
-			pr.node.updateCommitIndexWithBatching()
-		}
-	} else {
-		// Consistency check failed, decrement nextIndex
-		if pr.node.nextIndex[pr.peerID] > 1 {
-			pr.node.nextIndex[pr.peerID]--
-		}
-	}
+	pr.node.updatePeerIndices(pr.peerID, resp.success, resp.matchIndex)
 }
 
 // startPipelinedReplication initializes replicators for all peers
 func (np *Node) StartPipelinedReplication() {
 	np.replicatorsMu.Lock()
 	defer np.replicatorsMu.Unlock()
+
+	// Don't start if already running
+	if len(np.replicators) > 0 {
+		log.Printf("[%s] Pipeline already running (%d replicators)", np.id, len(np.replicators))
+		return
+	}
 
 	for peerID := range np.peers {
 		if peerID == np.id {
@@ -305,6 +273,12 @@ func (np *Node) StartPipelinedReplication() {
 func (np *Node) StopPipelinedReplication() {
 	// Lock only to read/clear replicators map
 	np.replicatorsMu.Lock()
+
+	if len(np.replicators) == 0 {
+		np.replicatorsMu.Unlock()
+		log.Printf("[%s] No pipeline to stop", np.id)
+		return
+	}
 
 	replicatorsCopy := make([]*PeerReplicator, 0, len(np.replicators))
 	for _, replicator := range np.replicators {
@@ -327,7 +301,6 @@ func (np *Node) StopPipelinedReplication() {
 func (np *Node) BecomeLeaderWithPipelining() {
 	// Stop old resources before acquiring lock
 	np.StopPipelinedReplication()
-	// np.stopHeartbeat()
 
 	np.mu.Lock()
 	// Double-check still candidate (might have stepped down)
@@ -374,13 +347,20 @@ func (np *Node) BecomeLeaderWithPipelining() {
 // Modified becomeFollower to stop replication
 func (np *Node) BecomeFollowerWithPipelining(term uint64) {
 	log.Printf("[%s] Transitioning to FOLLOWER (term %d)", np.id, term)
+
+	// Stop resources before acuiring lock
 	np.StopPipelinedReplication()
 	// stop heartbeat goroutine
 	np.stopHeartbeat()
 
+	np.mu.Lock()
+	defer np.mu.Unlock()
+
 	if term > 0 {
 		np.currentTerm = term
 		np.votedFor = ""
+		np.storage.SaveTerm(np.currentTerm)
+		np.storage.SaveVote(np.votedFor)
 	}
 
 	np.state = Follower

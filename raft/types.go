@@ -71,10 +71,10 @@ type Node struct {
 	proposalStop  chan struct{}         // Stop proposal processor
 
 	// Worker pool for bounded replcation
-	replicationQueue     chan string   // peerID to replicate to
-	replicationStop      chan struct{} // stop workers
-	replicationSignal    chan struct{} // signal for replication needed
-	replicationCoordDone chan struct{} // for clean shutdown
+	// replicationQueue     chan string   // peerID to replicate to
+	// replicationStop      chan struct{} // stop workers
+	// replicationSignal    chan struct{} // signal for replication needed
+	// replicationCoordDone chan struct{} // for clean shutdown
 
 	// Apply signal
 	applySignal chan struct{} // Signal when entries need applying

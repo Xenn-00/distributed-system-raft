@@ -43,6 +43,17 @@ func (n *Node) ProposalAsync(ctx context.Context, command []byte) (uint64, error
 	case resp := <-req.respCh:
 		return resp.index, resp.err
 	case <-ctx.Done():
+		go func() {
+			// Drain response channel to prevent goroutine leak
+			select {
+			case <-req.respCh:
+				// Drained
+			case <-time.After(5 * time.Second):
+				// Worker never responded (likely hung)
+				log.Printf("[%s] WARNING: Proposal worker did not respond after context cancel",
+					n.id)
+			}
+		}()
 		return 0, ctx.Err()
 	}
 }

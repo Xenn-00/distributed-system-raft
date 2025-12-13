@@ -109,7 +109,7 @@ func main() {
 	}
 
 	// Interactive CLI for testing
-	go startCLI(node, *nodeID)
+	// go startCLI(node, *nodeID)
 
 	// Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)

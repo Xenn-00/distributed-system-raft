@@ -143,8 +143,11 @@ func (n *Node) flushBatch(batch *proposalBatch) {
 				n.waitAndRespond(r, idx, term)
 			}(req, entry.Index)
 		default:
-			// semaphore full, wait synchronously
-			n.waitAndRespond(req, entry.Index, term)
+			// semaphore full, reject instead blocking
+			go func(r *proposalRequest) {
+				r.respCh <- &proposalResponse{err: fmt.Errorf("server overloaded (too many pending proposals)")}
+			}(req)
+
 		}
 	}
 }

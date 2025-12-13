@@ -8,70 +8,14 @@ import (
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
 )
 
-// Deprecated - from now instantly using repliation pipeline instead of worker
-func (n *Node) startReplicationWorkers() {
-	// Start 25 workers (12 per peer for 2 peers)
-	// This limits concurrent replication goroutines
-	numWorkers := 25
-
-	log.Printf("[%s] Starting %d replication workers", n.id, numWorkers)
-
-	for i := 0; i < numWorkers; i++ {
-		go n.replicationWorkers(i)
-	}
-}
-
-// worker goroutine that processes replication tasks
-func (n *Node) replicationWorkers(workerID int) {
-	for {
-		select {
-		case peerID := <-n.replicationQueue:
-			// process replication task
-			n.replicateToPeer(peerID)
-		case <-n.replicationStop:
-			log.Printf("[%s] Replication worker %d stopping", n.id, workerID)
-			return
-		case <-n.shutdownCh:
-			return
-		}
-	}
-}
-
-// replicationCoordinator runs as single goroutine
-func (n *Node) replicationCoordinator() {
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-n.replicationSignal:
-			// Signal received, do replication
-			n.replicateToAll()
-		case <-ticker.C:
-			// Periodic check (fallback)
-			n.mu.Lock()
-			isLeader := n.state == Leader
-			n.mu.Unlock()
-
-			if isLeader {
-				n.replicateToAll()
-			}
-
-		case <-n.shutdownCh:
-			log.Printf("[%s] Replication coordinator stopping", n.id)
-			return
-		}
-	}
-}
-
-// triggerReplication an helper to trigger replication (non-blocking)
+// triggerReplication an helper to trigger replication (non-blocking): now no-op
 func (n *Node) triggerReplication() {
-	select {
-	case n.replicationSignal <- struct{}{}:
-		// signal sent
-	default:
-		// already signaled
-	}
+	// select {
+	// case n.replicationSignal <- struct{}{}:
+	// 	// signal sent
+	// default:
+	// 	// already signaled
+	// }
 }
 
 // replicateToAll sends AppendEntries to all followers
@@ -90,129 +34,40 @@ func (n *Node) replicateToAll() {
 	// Sample logging: every 10th heartbeat
 	n.heartbeatCount++
 	sLog := shouldLog(n.heartbeatCount, 10)
-	// if sLog {
-	// 	log.Printf("[%s] Heartbeat #%d sent to %d peers (pipeline=%v)", n.id, n.heartbeatCount, len(n.peers)-1, hasPipeline)
-	// }
 	n.mu.Unlock()
 
-	if hasPipeline {
-		// Verify pipeline is healthy
-		n.lastHeartbeatAckMu.Lock()
-		stalePeers := []string{}
-		for peerID := range n.peers {
-			if peerID == n.id {
-				continue
-			}
-			lastAck, ok := n.lastHeartbeatAck[peerID]
-			if !ok || time.Since(lastAck) > 5*HeartbeatInterval {
-				stalePeers = append(stalePeers, peerID)
-			}
-		}
-		n.lastHeartbeatAckMu.Unlock()
-		if len(stalePeers) > 0 && sLog {
-			log.Printf("[%s] WARNING: %d peers haven't acked recently: %v", n.id, len(stalePeers), stalePeers)
-		}
-
-		// Pipeline handles it
+	if !hasPipeline {
+		log.Printf("[%s] CRITICAL: No pipeline active! Starting...", n.id)
+		go n.StartPipelinedReplication()
 		return
 	}
 
-	// Fallback: direct replication (if pipeline not started)
+	// Check pipeline health
+	n.lastHeartbeatAckMu.Lock()
+	stalePeers := []string{}
 	for peerID := range n.peers {
 		if peerID == n.id {
 			continue
 		}
-		go n.replicateToPeer(peerID)
-	}
-	n.mu.Unlock()
-}
 
-// replicateToPeer sends AppendEntries to a specific peer
-func (n *Node) replicateToPeer(peerID string) {
-	n.mu.Lock()
-
-	if n.state != Leader {
-		n.mu.Unlock()
-		return
-	}
-
-	// Rate limiting: Skip if too many recent failures
-	failures := n.replicationFailures[peerID]
-	lastFail := n.lastFailureTime[peerID]
-
-	if failures > 0 {
-		// Exponential backoff: 100ms, 200ms, 400ms, 800ms, max 5s
-		backoff := min(time.Duration(100*(1<<uint(failures-1)))*time.Millisecond, 5*time.Second)
-
-		if time.Since(lastFail) < backoff {
-			// Too soon to retry, skip
-			n.mu.Unlock()
-			return
+		lastAck, ok := n.lastHeartbeatAck[peerID]
+		if !ok || time.Since(lastAck) > 5*HeartbeatInterval {
+			stalePeers = append(stalePeers, peerID)
 		}
 	}
+	n.lastHeartbeatAckMu.Unlock()
+	if len(stalePeers) > 0 && sLog {
+		log.Printf("[%s] WARNING: Stale peers: %v", n.id, stalePeers)
 
-	// Get next index for this peer
-	nextIdx := n.nextIndex[peerID]
-	if nextIdx == 0 {
-		nextIdx = 1
-	}
-
-	// Check if we need to send snapshot
-	var firstLogIndex uint64 = 1
-	if len(n.log) > 0 {
-		firstLogIndex = n.log[0].Index
-	} else if n.storage.HasSnapshot() {
-		snapIndex, _, _, _ := n.storage.LoadSnapshot()
-		firstLogIndex = snapIndex + 1
-	}
-
-	// If nextIndex is behind our first log entry, send snapshot
-	if nextIdx < firstLogIndex {
-		log.Printf("[%s] Peer %s is too far behind (nextIndex=%d, firstLogIndex=%d)", n.id, peerID, nextIdx, firstLogIndex)
+		// Check failure counts
+		n.mu.Lock()
+		for _, peerID := range stalePeers {
+			failures := n.replicationFailures[peerID]
+			if failures > 0 {
+				log.Printf("[%s] - %s: %d consecutive failures", n.id, peerID, failures)
+			}
+		}
 		n.mu.Unlock()
-		n.sendSnapshot(peerID)
-		return
-	}
-
-	// Prepare AppendEntries request
-	req := n.prepareAppendEntriesRequest(nextIdx)
-	term := n.currentTerm
-	leaderCommit := n.commitIndex
-	req.LeaderCommit = leaderCommit
-	n.mu.Unlock()
-
-	// Send RPC
-	success, higherTerm := n.sendAppendEntries(peerID, req, term)
-
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	// Check if still leader
-	if n.state != Leader || n.currentTerm != term {
-		return
-	}
-
-	// Handle higher term
-	if higherTerm > 0 {
-		log.Printf("[%s] Stepping down: received higher term %d", n.id, higherTerm)
-		n.currentTerm = higherTerm
-		n.votedFor = ""
-		n.leaderID = ""
-		n.storage.SaveTerm(n.currentTerm)
-		n.storage.SaveVote(n.votedFor)
-
-		// Unlock before calling becomeFollower
-		n.mu.Unlock()
-		// n.becomeFollower(higherTerm)
-		n.BecomeFollowerWithPipelining(higherTerm)
-		return
-	}
-
-	// Handle response
-	if success {
-		n.handleSuccessfulReplication(peerID, req.Entries)
-	} else {
-		n.handleFailedReplication(peerID)
 	}
 }
 
@@ -247,13 +102,12 @@ func (n *Node) prepareAppendEntriesRequest(nextIdx uint64) *pb.AppendEntriesRequ
 	}
 }
 
-// sendAppendEntries sends AppendEntries RPC and returns (success, higherTerm)
-func (n *Node) sendAppendEntries(peerID string, req *pb.AppendEntriesRequest, term uint64) (bool, uint64) {
+// sendAppendEntriesRPC sends AppendEntries RPC and returns (success, higherTerm)
+func (n *Node) sendAppendEntriesRPC(peerID string, req *pb.AppendEntriesRequest, term uint64) (bool, uint64, error) {
 	client, err := n.getClient(peerID)
 	if err != nil {
 		log.Printf("[%s] Failed to get client for %s: %v", n.id, peerID, err)
-		n.recordReplicationFailure(peerID, len(req.Entries) > 10)
-		return false, 0
+		return false, 0, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -264,8 +118,7 @@ func (n *Node) sendAppendEntries(peerID string, req *pb.AppendEntriesRequest, te
 	latency := time.Since(start)
 	if err != nil {
 		log.Printf("[%s] AppendEntries to %s FAILED (latency: %v): %v", n.id, peerID, latency, err)
-		n.recordReplicationFailure(peerID, len(req.Entries) > 10)
-		return false, 0
+		return false, 0, err
 	}
 
 	// Log slow RPCs
@@ -275,49 +128,62 @@ func (n *Node) sendAppendEntries(peerID string, req *pb.AppendEntriesRequest, te
 
 	// Check for higher term
 	if resp.Term > term {
-		return false, resp.Term
+		return false, resp.Term, nil
 	}
 
-	return resp.Success, 0
+	return resp.Success, 0, nil
 }
 
-// handleSuccessfulReplication updates matchIndex and nextIndex after successful replication
-func (n *Node) handleSuccessfulReplication(peerID string, entries []*pb.LogEntry) {
-	n.replicationFailures[peerID] = 0
-	delete(n.lastFailureTime, peerID)
+// updatePeerIndices updates nextIndex and matchIndex after replication attempt.
+// Must be called with n.mu held!
+func (n *Node) updatePeerIndices(peerID string, success bool, matchIndex uint64) {
+	if success && matchIndex > 0 {
+		// Success: advance indices
+		oldMatch := n.matchIndex[peerID]
+		n.matchIndex[peerID] = matchIndex
+		n.nextIndex[peerID] = matchIndex + 1
 
-	if len(entries) > 0 {
-		lastIdx := entries[len(entries)-1].Index
-		n.matchIndex[peerID] = lastIdx
-		n.nextIndex[peerID] = lastIdx + 1
-		if shouldLog(lastIdx, 10) {
-			log.Printf("[%s] Peer %s replicated up to index %d", n.id, peerID, lastIdx)
+		// Sample logging
+		if shouldLog(matchIndex, 10) {
+			log.Printf("[%s] Peer %s: matchIndex %d->%d, nextIndex=%d", n.id, peerID, oldMatch, matchIndex, n.nextIndex[peerID])
 		}
+
+		// Try to advance commit index
 		n.updateCommitIndexWithBatching()
-	}
-}
+	} else if !success {
+		// Consistency check failed: backtrack nextIndex
+		if n.nextIndex[peerID] > 1 {
+			oldNext := n.nextIndex[peerID]
+			n.nextIndex[peerID]--
 
-// handleFailedReplication handles AppendEntries rejection
-func (n *Node) handleFailedReplication(peerID string) {
-	if n.nextIndex[peerID] > 1 {
-		n.nextIndex[peerID]--
-		if shouldLog(n.nextIndex[peerID], 5) {
-			log.Printf("[%s] Peer %s rejected, decrementing nextIndex to %d",
-				n.id, peerID, n.nextIndex[peerID])
+			if shouldLog(n.nextIndex[peerID], 5) {
+				log.Printf("[%s] Peer %s: consistency failed, nextIndex %d->%d", n.id, peerID, oldNext, n.nextIndex[peerID])
+			}
 		}
 	}
 }
 
-// recordReplicationFailure tracks consecutive failures for rate limiting
-func (n *Node) recordReplicationFailure(peerID string, shouldLog bool) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+// recordReplicationOutcome tracks replication success/failure for monitoring.
+// Updates failure counters and hearbeat ack timestamps.
+func (n *Node) recordReplicationOutcome(peerID string, success bool, err error) {
+	if err != nil || !success {
+		// Failure: increment counter
+		n.replicationFailures[peerID]++
+		n.lastFailureTime[peerID] = time.Now()
 
-	n.replicationFailures[peerID]++
-	n.lastFailureTime[peerID] = time.Now()
+		// Log only first few failures to avoid spam
+		if n.replicationFailures[peerID] <= 3 {
+			log.Printf("[%s] Replication to %s failed (count: %d): %v", n.id, peerID, n.replicationFailures[peerID], err)
+		}
+	} else {
+		// Success: reset counters
+		n.replicationFailures[peerID] = 0
+		delete(n.lastFailureTime, peerID)
 
-	if shouldLog && n.replicationFailures[peerID] <= 3 {
-		log.Printf("[%s] Replication to %s failed (failure %d)", n.id, peerID, n.replicationFailures[peerID])
+		// Update last ack timestamp
+		n.lastHeartbeatAckMu.Lock()
+		n.lastHeartbeatAck[peerID] = time.Now()
+		n.lastHeartbeatAckMu.Unlock()
 	}
 }
 
@@ -326,7 +192,7 @@ func (n *Node) sendHeartbeats() {
 	for {
 		select {
 		case <-n.heartbeatTimer.C:
-			n.triggerReplication() // instead of call direct n.replicateToAll
+			n.replicateToAll() // just to verify pipeline health
 		case <-n.heartbeatStop:
 			log.Printf("[%s] Heartbeat goroutine stopping (heartbeatStop signal)", n.id)
 			return

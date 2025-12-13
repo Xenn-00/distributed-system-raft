@@ -25,38 +25,38 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 	}
 
 	node := &Node{
-		id:                   id,
-		state:                Follower,
-		peers:                peers,
-		currentTerm:          0,
-		votedFor:             "",
-		log:                  make([]*pb.LogEntry, 0),
-		commitIndex:          0,
-		lastApplied:          0,
-		leaderID:             "",
-		nextIndex:            make(map[string]uint64),
-		matchIndex:           make(map[string]uint64),
-		shutdownCh:           make(chan struct{}),
-		clients:              make(map[string]pb.RaftClient),
-		connections:          make(map[string]*grpc.ClientConn),
-		kvStore:              kv.NewKVStore(),
-		storage:              stor,
-		lastSnapshotTime:     time.Now(),
-		lastSnapshotIndex:    0,
-		proposalQueue:        make(chan *proposalRequest, 128), // Max 128 queued
-		ProposalSem:          make(chan struct{}, 128),         // Max 128 in-flight
-		proposalStop:         make(chan struct{}),
-		replicationQueue:     make(chan string, 128), // Buffer 128 tasks
-		replicationSignal:    make(chan struct{}, 1),
-		replicationCoordDone: make(chan struct{}),
-		replicationStop:      make(chan struct{}),
-		heartbeatStop:        make(chan struct{}),
-		applySignal:          make(chan struct{}, 1),
-		applyDone:            make(chan struct{}),
-		lastHeartbeatAck:     make(map[string]time.Time),
-		replicationFailures:  make(map[string]int),
-		replicators:          make(map[string]*PeerReplicator),
-		lastFailureTime:      make(map[string]time.Time),
+		id:                id,
+		state:             Follower,
+		peers:             peers,
+		currentTerm:       0,
+		votedFor:          "",
+		log:               make([]*pb.LogEntry, 0),
+		commitIndex:       0,
+		lastApplied:       0,
+		leaderID:          "",
+		nextIndex:         make(map[string]uint64),
+		matchIndex:        make(map[string]uint64),
+		shutdownCh:        make(chan struct{}),
+		clients:           make(map[string]pb.RaftClient),
+		connections:       make(map[string]*grpc.ClientConn),
+		kvStore:           kv.NewKVStore(),
+		storage:           stor,
+		lastSnapshotTime:  time.Now(),
+		lastSnapshotIndex: 0,
+		proposalQueue:     make(chan *proposalRequest, 500), // Max 128 queued
+		ProposalSem:       make(chan struct{}, 500),         // Max 128 in-flight
+		proposalStop:      make(chan struct{}),
+		// replicationQueue:     make(chan string, 128), // Buffer 128 tasks
+		// replicationSignal:    make(chan struct{}, 1),
+		// replicationCoordDone: make(chan struct{}),
+		// replicationStop:      make(chan struct{}),
+		heartbeatStop:       make(chan struct{}),
+		applySignal:         make(chan struct{}, 1),
+		applyDone:           make(chan struct{}),
+		lastHeartbeatAck:    make(map[string]time.Time),
+		replicationFailures: make(map[string]int),
+		replicators:         make(map[string]*PeerReplicator),
+		lastFailureTime:     make(map[string]time.Time),
 	}
 	// Restore from disk
 	if err := node.restoreFromStorage(); err != nil {
@@ -262,7 +262,7 @@ func (n *Node) Start() {
 	go n.monitorConnectionHealth()
 
 	go n.processProposalWithBatching()
-	go n.replicationCoordinator()
+	// go n.replicationCoordinator()
 	go n.applyCoordinator()
 
 	// Start replication workers
@@ -347,13 +347,13 @@ func (n *Node) Shutdown() {
 	})
 
 	// Stop worker pool and coordinators
-	close(n.replicationStop)
+	// close(n.replicationStop)
 	close(n.shutdownCh)
 
 	// Wait for coordinators with timeout
 	done := make(chan struct{})
 	go func() {
-		<-n.replicationCoordDone
+		// <-n.replicationCoordDone
 		<-n.applyDone
 		close(done)
 	}()

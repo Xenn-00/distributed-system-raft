@@ -158,11 +158,14 @@ func (n *Node) periodicSnapshotCheck() {
 	}
 }
 
-// sendSnapshot sends InstallSnapshot RPC to a peer
-
-// TODO: apply backoff
+// sendSnapshot sends InstallSnapshot RPC when peer is too far behind
 func (n *Node) sendSnapshot(peerID string) {
 	n.mu.Lock()
+
+	if n.state != Leader {
+		n.mu.Unlock()
+		return
+	}
 
 	// Rate limiting: Skip if too many recent failures
 	failures := n.replicationFailures[peerID]
@@ -201,6 +204,7 @@ func (n *Node) sendSnapshot(peerID string) {
 	// Get client
 	client, err := n.getClient(peerID)
 	if err != nil {
+		log.Printf("[%s] Failed to get client for %s: %v", n.id, peerID, err)
 		return
 	}
 
@@ -251,13 +255,13 @@ func (n *Node) sendSnapshot(peerID string) {
 		log.Printf("[%s] Stepping down: peer %s has higher term %d", n.id, peerID, resp.Term)
 		n.currentTerm = resp.Term
 		n.votedFor = ""
-		n.state = Follower
 		n.leaderID = ""
-		if n.heartbeatTimer != nil {
-			n.heartbeatTimer.Stop()
-		}
+		n.storage.SaveTerm(n.currentTerm)
+		n.storage.SaveVote(n.votedFor)
 
-		n.resetElectionTimer()
+		n.mu.Unlock()
+		n.BecomeFollowerWithPipelining(resp.Term)
+		n.mu.Lock()
 		return
 	}
 
