@@ -12,9 +12,11 @@ const totalOperations = new Counter("total_operations");
 export const options = {
   stages: [
     { duration: "10s", target: 10 }, // Warm up
-    { duration: "10s", target: 50 }, // Ramp up
-    { duration: "10s", target: 10 }, // steady
-    { duration: "10s", target: 0 }, // Ramp down
+    { duration: "10s", target: 50 }, // Warm up
+    { duration: "10s", target: 50 }, // steady
+    { duration: "10s", target: 50 }, // steady
+    { duration: "15s", target: 20 }, // ramp down
+    { duration: "10s", target: 0 }, // ramp down
   ],
   thresholds: {
     success_rate: ["rate>0.95"],

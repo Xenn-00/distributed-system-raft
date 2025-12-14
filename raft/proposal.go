@@ -40,20 +40,13 @@ func (n *Node) ProposalAsync(ctx context.Context, command []byte) (uint64, error
 
 	// Wait for response from worker
 	select {
-	case resp := <-req.respCh:
+	case resp, ok := <-req.respCh:
+		if !ok {
+			// worker exited / shutdown
+			return 0, context.Canceled
+		}
 		return resp.index, resp.err
 	case <-ctx.Done():
-		go func() {
-			// Drain response channel to prevent goroutine leak
-			select {
-			case <-req.respCh:
-				// Drained
-			case <-time.After(5 * time.Second):
-				// Worker never responded (likely hung)
-				log.Printf("[%s] WARNING: Proposal worker did not respond after context cancel",
-					n.id)
-			}
-		}()
 		return 0, ctx.Err()
 	}
 }

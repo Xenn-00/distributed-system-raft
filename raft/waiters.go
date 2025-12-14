@@ -88,11 +88,16 @@ func (n *Node) unregisterApplyWaiter(index uint64, waiterCh chan struct{}) {
 
 // waitAndRespond waits for commit and sends response
 func (n *Node) waitAndRespond(req *proposalRequest, index uint64, term uint64) {
+	defer close(req.respCh)
 	// Wait for commit
 	err := n.waitForCommit(req.ctx, index)
 
 	// Send response
 	select {
+	case <-req.ctx.Done():
+		req.respCh <- &proposalResponse{
+			err: context.Canceled,
+		}
 	case req.respCh <- &proposalResponse{index: index, err: err}:
 	case <-time.After(100 * time.Millisecond):
 		log.Printf("[%s] Client abandoned proposal for index %d at term %d", n.id, index, term)

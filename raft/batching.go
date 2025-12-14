@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -23,7 +24,7 @@ type proposalBatch struct {
 
 // processProposalWithBatching replaces the old processProposals
 // If something goes wrong, then just rollback to processProposals 🙃
-func (n *Node) processProposalWithBatching() {
+func (n *Node) processProposalWithBatching(ctx context.Context) {
 	ticker := time.NewTicker(BatchTimeout)
 	defer ticker.Stop()
 
@@ -34,7 +35,13 @@ func (n *Node) processProposalWithBatching() {
 
 	for {
 		select {
-		case req := <-n.proposalQueue:
+		case <-ctx.Done():
+			return
+		case req, ok := <-n.proposalQueue:
+			if !ok {
+				log.Printf("[%s] proposalQueue closed", n.id)
+				return
+			}
 			// Add to current batch
 			currentBatch.requests = append(currentBatch.requests, req)
 
@@ -126,8 +133,8 @@ func (n *Node) flushBatch(batch *proposalBatch) {
 
 	log.Printf("[%s] Flushed batch of %d entries (index %d-%d)", n.id, len(batch.entries), startIndex, startIndex+uint64(len(batch.entries))-1)
 
-	// Triger replication (all entries will be sent together)
-	n.triggerReplication() // instead of using go n.replicateToAll()
+	// // Triger replication (all entries will be sent together)
+	// n.triggerReplication() // instead of using go n.replicateToAll()
 
 	// Wait for each entry to commit individually
 	for i, req := range batch.requests {

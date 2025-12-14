@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"log"
 
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
@@ -182,13 +183,15 @@ func (n *Node) applyEntries() {
 }
 
 // same with replicationCoordinator, applyCoordinator also runs as single goroutine
-func (n *Node) applyCoordinator() {
+func (n *Node) applyCoordinator(ctx context.Context) {
 	defer close(n.applyDone)
 
 	log.Printf("[%s] Apply coordinator started", n.id)
 
 	for {
 		select {
+		case <-n.ctx.Done():
+			return
 		case <-n.applySignal:
 			// Signal received, apply entries
 			n.applyEntries()

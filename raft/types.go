@@ -16,6 +16,9 @@ type Node struct {
 	mu      sync.Mutex
 	applyMu sync.Mutex
 
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	// Persistent state
 	currentTerm uint64
 	votedFor    string
@@ -41,6 +44,8 @@ type Node struct {
 	heartbeatTimer              *time.Ticker
 	heartbeatCount              uint64 // track heartbeats
 	heartbeatStop               chan struct{}
+	heartbeatCtx                context.Context
+	heartbeatCancel             context.CancelFunc
 	heartbeatRunning            atomic.Bool // track if heartbeats is running
 	lastHeartbeatAck            map[string]time.Time
 	lastHeartbeatAckMu          sync.Mutex

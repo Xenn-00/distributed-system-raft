@@ -187,17 +187,16 @@ func (n *Node) recordReplicationOutcome(peerID string, success bool, err error) 
 	}
 }
 
-func (n *Node) sendHeartbeats() {
+func (n *Node) sendHeartbeats(ctx context.Context) {
 	defer n.heartbeatRunning.Store(false) // Clear flag
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-n.heartbeatTimer.C:
 			n.replicateToAll() // just to verify pipeline health
 		case <-n.heartbeatStop:
 			log.Printf("[%s] Heartbeat goroutine stopping (heartbeatStop signal)", n.id)
-			return
-		case <-n.shutdownCh:
-			log.Printf("[%s] Heartbeat goroutine stopping (shutdown signal)", n.id)
 			return
 		}
 	}

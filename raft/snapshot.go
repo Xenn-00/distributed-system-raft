@@ -144,12 +144,14 @@ func (n *Node) createSnapshot() error {
 }
 
 // periodicSnapshotCheck checks for snapshot based on time
-func (n *Node) periodicSnapshotCheck() {
+func (n *Node) periodicSnapshotCheck(ctx context.Context) {
 	ticker := time.NewTicker(SnapshotInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case <-n.ctx.Done():
+			return
 		case <-ticker.C:
 			n.maybeSnapshotByTime()
 		case <-n.shutdownCh:

@@ -80,12 +80,13 @@ func (n *Node) becomeLeader() {
 		n.electionTimer.Stop()
 	}
 	n.heartbeatTimer = time.NewTicker(HeartbeatInterval)
+	n.heartbeatCtx, n.heartbeatCancel = context.WithCancel(n.ctx)
 
 	log.Printf("[%s] Became LEADER at term %d (lastLogIndex=%d)", n.id, n.currentTerm, lastLogIndex)
 
 	go n.StartPipelinedReplication()
 	// Start sending heartbeats
-	go n.sendHeartbeats()
+	go n.sendHeartbeats(n.heartbeatCtx)
 }
 
 func (n *Node) resetElectionTimer() {

@@ -17,10 +17,13 @@ const (
 
 // PeerReplicator manages pipelined replication to a single peer
 type PeerReplicator struct {
-	peerID    string
-	node      *Node
+	peerID string
+	node   *Node
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	inflightQ chan *replicationTask // Queue of in-flight tasks
-	stopCh    chan struct{}
 	wg        sync.WaitGroup
 }
 
@@ -41,20 +44,21 @@ type replicationResponse struct {
 
 // newPeerReplicator creates a new pipelined replicator for a peer
 func newPeerReplicator(peerID string, node *Node) *PeerReplicator {
+	ctx, cancel := context.WithCancel(node.ctx)
 	return &PeerReplicator{
 		peerID:    peerID,
 		node:      node,
+		ctx:       ctx,
+		cancel:    cancel,
 		inflightQ: make(chan *replicationTask, MaxInFlightRPCs),
-		stopCh:    make(chan struct{}),
 	}
 }
 
 // start begins pipelined replication
 func (pr *PeerReplicator) start() {
-	pr.wg.Add(1)
-	go pr.sendLoop()
+	pr.wg.Add(2)
 
-	pr.wg.Add(1)
+	go pr.sendLoop()
 	go pr.receiveLoop()
 
 	log.Printf("[%s] Started pipeline for peer %s", pr.node.id, pr.peerID)
@@ -62,7 +66,8 @@ func (pr *PeerReplicator) start() {
 
 // stop gracefully shutdown the replicator
 func (pr *PeerReplicator) stop() {
-	close(pr.stopCh)
+	pr.cancel() // signal all running goroutine
+	close(pr.inflightQ)
 
 	// Wait with timeout (prevent infinite hang)
 	done := make(chan struct{})
@@ -89,32 +94,135 @@ func (pr *PeerReplicator) sendLoop() {
 	defer ticker.Stop()
 	for {
 		select {
+		case <-pr.ctx.Done():
+			log.Printf("[%s] Pipeline sendLoop STOPPING for peer %s", pr.node.id, pr.peerID)
+			return
 		case <-ticker.C:
 			pr.maybeSendBatch()
-		case <-pr.stopCh:
-			log.Printf("[%s] Pipeline sendLoop STOPPING for peer %s", pr.node.id, pr.peerID)
+		}
+	}
+}
+
+// receiveLo0p processes responses
+func (pr *PeerReplicator) receiveLoop() {
+	defer pr.wg.Done()
+
+	log.Printf("[%s] Pipeline receiveLoop STARTED for peer %s", pr.node.id, pr.peerID)
+
+	for {
+		select {
+		case <-pr.ctx.Done():
+			// Shutdown requested
+			log.Printf("[%s] Replicator for %s stopped", pr.node.id, pr.peerID)
+
+			// Drain remaining tasks before exit
+			pr.drainInflightQueue()
+			return
+		case task, ok := <-pr.inflightQ:
+			if !ok {
+				// Channel closed, exit gracefully
+				log.Printf("[%s] inflightQ closed for %s, exiting", pr.node.id, pr.peerID)
+				return
+			}
+
+			// Process task with timeout
+			pr.processTaskWithTimeout(task)
+		}
+	}
+}
+
+// drainInflightQueue helper to drain queue on shutdown
+func (pr *PeerReplicator) drainInflightQueue() {
+	drained := 0
+	for {
+		select {
+		case task, ok := <-pr.inflightQ:
+			if !ok {
+				// Channel closed
+				if drained > 0 {
+					log.Printf("[%s] Drained %d pending tasks for %s", pr.node.id, drained, pr.peerID)
+				}
+				return
+			}
+
+			// Send cancellation error
+			select {
+			case task.respCh <- &replicationResponse{
+				err: context.Canceled,
+			}:
+			default:
+				// Response channel full, skip
+			}
+			drained++
+		default:
+			// Queue empty
+			if drained > 0 {
+				log.Printf("[%s] Drained %d pending tasks for %s", pr.node.id, drained, pr.peerID)
+			}
 			return
 		}
 	}
 }
 
+// processTaskWithTimeout process task with context check
+func (pr *PeerReplicator) processTaskWithTimeout(task *replicationTask) {
+	timer := time.NewTicker(2 * RPCTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-pr.ctx.Done():
+		return
+	case resp := <-task.respCh:
+		pr.handleResponse(task, resp)
+	case <-timer.C:
+		pr.handleResponse(task, &replicationResponse{
+			err: context.DeadlineExceeded,
+		})
+	}
+}
+
 // maybeSendBatch sends a batch of entries if needed
 func (pr *PeerReplicator) maybeSendBatch() {
-	pr.node.mu.Lock()
+	// Early context check
+	if pr.ctx.Err() != nil {
+		return
+	}
+
+	// Try lock with timeout (non-blocking)
+	lockAcquired := make(chan struct{})
+	go func() {
+		pr.node.mu.Lock()
+		close(lockAcquired)
+	}()
+
+	select {
+	case <-lockAcquired:
+		// Got lock
+		defer pr.node.mu.Unlock()
+	case <-time.After(100 * time.Millisecond):
+		// Lock timeout, skip this cycle
+		return
+	case <-pr.ctx.Done():
+		// Context cancelled while waiting
+		return
+	}
+
+	// Check context again after lock
+	if pr.ctx.Err() != nil {
+		return
+	}
 
 	if pr.node.state != Leader {
-		pr.node.mu.Unlock()
 		return
+	}
+
+	// Check in-flight limit
+	if len(pr.inflightQ) >= MaxInFlightRPCs {
+		return // Too many in-flight
 	}
 
 	// Check if there's work to do
 	nextIdx := pr.node.nextIndex[pr.peerID]
-
-	// Check in-flight limit
-	if len(pr.inflightQ) >= MaxInFlightRPCs {
-		pr.node.mu.Unlock()
-		return // Too many in-flight
-	}
 
 	// Check if peer needs snapshot
 	var firstLogIndex uint64 = 1
@@ -128,18 +236,21 @@ func (pr *PeerReplicator) maybeSendBatch() {
 	// Peer too far behind - need snapshot
 	if nextIdx < firstLogIndex {
 		log.Printf("[%s] Peer %s needs snapshot (next=%d, first=%d)", pr.node.id, pr.peerID, nextIdx, firstLogIndex)
-		pr.node.mu.Unlock()
-
 		// Send snapshot in background
-		go pr.node.sendSnapshot(pr.peerID)
+		go func() {
+			select {
+			case <-pr.ctx.Done():
+				return
+			default:
+				pr.node.sendSnapshot(pr.peerID)
+			}
+		}()
 		return
 	}
 
 	// Prepare request
-	req := pr.node.prepareAppendEntriesRequest(nextIdx) // call within lock
 	term := pr.node.currentTerm
-
-	pr.node.mu.Unlock()
+	req := pr.node.prepareAppendEntriesRequest(nextIdx) // call within lock
 
 	// Create task
 	task := &replicationTask{
@@ -148,12 +259,14 @@ func (pr *PeerReplicator) maybeSendBatch() {
 		sentAt: time.Now(),
 	}
 
-	// Send RPC asynchronously
-	go pr.sendRPC(task, term)
-
 	// Track in-flight
 	select {
 	case pr.inflightQ <- task: // Successfully queued
+		pr.wg.Add(1)
+		go pr.sendRPC(task, term)
+	case <-pr.ctx.Done():
+		// Context cancelled while queuing
+		return
 	default:
 		// Queue full (shouldn't happen. but be defensive)
 		log.Printf("[%s] In-flight queue full for %s", pr.node.id, pr.peerID)
@@ -162,6 +275,8 @@ func (pr *PeerReplicator) maybeSendBatch() {
 
 // sendRPC sends the AppendEntries RPC
 func (pr *PeerReplicator) sendRPC(task *replicationTask, term uint64) {
+	defer pr.wg.Done()
+
 	success, higherTerm, err := pr.node.sendAppendEntriesRPC(pr.peerID, task.req, term)
 	// Calculate matchIndex from request
 	var matchIndex uint64
@@ -169,44 +284,17 @@ func (pr *PeerReplicator) sendRPC(task *replicationTask, term uint64) {
 		matchIndex = task.req.Entries[len(task.req.Entries)-1].Index
 	}
 
-	// Send response back to receiveLoop
-	task.respCh <- &replicationResponse{
+	resp := &replicationResponse{
 		success:    success,
 		matchIndex: matchIndex,
 		higherTerm: higherTerm,
 		err:        err,
 	}
-}
 
-// receiveLo0p processes responses
-func (pr *PeerReplicator) receiveLoop() {
-	defer pr.wg.Done()
-
-	log.Printf("[%s] Pipeline receiveLoop STARTED for peer %s", pr.node.id, pr.peerID)
-
-	for {
-		select {
-		case task := <-pr.inflightQ:
-			// Wait for response
-			select {
-			case resp := <-task.respCh:
-				pr.handleResponse(task, resp)
-			case <-time.After(2 * RPCTimeout):
-				// Timeout - treat as failure
-				pr.handleResponse(task, &replicationResponse{
-					err: context.DeadlineExceeded,
-				})
-			case <-pr.stopCh:
-				// Shutdown requested, drain this task then exit
-				log.Printf("[%s] Replicator for %s stopping (draining task)",
-					pr.node.id, pr.peerID)
-				return
-			}
-		case <-pr.stopCh:
-			// Shutdown requested
-			log.Printf("[%s] Replicator for %s stopped", pr.node.id, pr.peerID)
-			return
-		}
+	select {
+	case task.respCh <- resp:
+	case <-pr.ctx.Done():
+		return
 	}
 }
 
@@ -336,12 +424,13 @@ func (np *Node) BecomeLeaderWithPipelining() {
 	np.heartbeatStop = make(chan struct{})
 	np.heartbeatTimer = time.NewTicker(HeartbeatInterval)
 	np.heartbeatRunning.Store(true) // Mark as running
+	np.heartbeatCtx, np.heartbeatCancel = context.WithCancel(np.ctx)
 	log.Printf("[%s] Became LEADER at term %d (pipelined mode)", np.id, np.currentTerm)
 	np.mu.Unlock()
 
 	// Start pipelined replication
 	go np.StartPipelinedReplication()
-	go np.sendHeartbeats()
+	go np.sendHeartbeats(np.heartbeatCtx)
 }
 
 // Modified becomeFollower to stop replication

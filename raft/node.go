@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -25,31 +26,27 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 	}
 
 	node := &Node{
-		id:                id,
-		state:             Follower,
-		peers:             peers,
-		currentTerm:       0,
-		votedFor:          "",
-		log:               make([]*pb.LogEntry, 0),
-		commitIndex:       0,
-		lastApplied:       0,
-		leaderID:          "",
-		nextIndex:         make(map[string]uint64),
-		matchIndex:        make(map[string]uint64),
-		shutdownCh:        make(chan struct{}),
-		clients:           make(map[string]pb.RaftClient),
-		connections:       make(map[string]*grpc.ClientConn),
-		kvStore:           kv.NewKVStore(),
-		storage:           stor,
-		lastSnapshotTime:  time.Now(),
-		lastSnapshotIndex: 0,
-		proposalQueue:     make(chan *proposalRequest, 500), // Max 128 queued
-		ProposalSem:       make(chan struct{}, 500),         // Max 128 in-flight
-		proposalStop:      make(chan struct{}),
-		// replicationQueue:     make(chan string, 128), // Buffer 128 tasks
-		// replicationSignal:    make(chan struct{}, 1),
-		// replicationCoordDone: make(chan struct{}),
-		// replicationStop:      make(chan struct{}),
+		id:                  id,
+		state:               Follower,
+		peers:               peers,
+		currentTerm:         0,
+		votedFor:            "",
+		log:                 make([]*pb.LogEntry, 0),
+		commitIndex:         0,
+		lastApplied:         0,
+		leaderID:            "",
+		nextIndex:           make(map[string]uint64),
+		matchIndex:          make(map[string]uint64),
+		shutdownCh:          make(chan struct{}),
+		clients:             make(map[string]pb.RaftClient),
+		connections:         make(map[string]*grpc.ClientConn),
+		kvStore:             kv.NewKVStore(),
+		storage:             stor,
+		lastSnapshotTime:    time.Now(),
+		lastSnapshotIndex:   0,
+		proposalQueue:       make(chan *proposalRequest, 500), // Max 128 queued
+		ProposalSem:         make(chan struct{}, 500),         // Max 128 in-flight
+		proposalStop:        make(chan struct{}),
 		heartbeatStop:       make(chan struct{}),
 		applySignal:         make(chan struct{}, 1),
 		applyDone:           make(chan struct{}),
@@ -207,12 +204,14 @@ func (n *Node) getClient(peerID string) (pb.RaftClient, error) {
 }
 
 // Periodically check and close dead connections
-func (n *Node) monitorConnectionHealth() {
+func (n *Node) monitorConnectionHealth(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-ticker.C:
 			n.checkConnectionHealth()
 		case <-n.shutdownCh:
@@ -242,6 +241,7 @@ func (n *Node) checkConnectionHealth() {
 }
 
 func (n *Node) Start() {
+	n.ctx, n.cancel = context.WithCancel(context.Background())
 	initialDelay := time.Duration(rand.Int63n(2000)) * time.Millisecond
 	log.Printf("[%s] Starting node as %s (initial delay: %v)", n.id, n.state, initialDelay)
 	time.Sleep(initialDelay)
@@ -259,26 +259,22 @@ func (n *Node) Start() {
 	n.resetElectionTimer()
 	n.mu.Unlock()
 
-	go n.monitorConnectionHealth()
-
-	go n.processProposalWithBatching()
-	// go n.replicationCoordinator()
-	go n.applyCoordinator()
-
-	// Start replication workers
-	// n.startReplicationWorkers() // using pipelined instead
-	// Start periodic snapshot check
-	go n.periodicSnapshotCheck()
-	go n.reportFailures()
-	go n.run()
+	go n.monitorConnectionHealth(n.ctx)
+	go n.processProposalWithBatching(n.ctx)
+	go n.applyCoordinator(n.ctx)
+	go n.periodicSnapshotCheck(n.ctx)
+	go n.reportFailures(n.ctx)
+	go n.run(n.ctx)
 }
 
-func (n *Node) reportFailures() {
+func (n *Node) reportFailures(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-ticker.C:
 			n.mu.Lock()
 
@@ -296,9 +292,11 @@ func (n *Node) reportFailures() {
 	}
 }
 
-func (n *Node) run() {
+func (n *Node) run(ctx context.Context) {
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-n.shutdownCh:
 			return
 		case <-n.electionTimer.C:
@@ -346,6 +344,7 @@ func (n *Node) Shutdown() {
 		return true
 	})
 
+	// close(n.proposalQueue)
 	// Stop worker pool and coordinators
 	// close(n.replicationStop)
 	close(n.shutdownCh)
