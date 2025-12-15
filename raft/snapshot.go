@@ -140,6 +140,9 @@ func (n *Node) createSnapshot() error {
 	log.Printf("[%s] Snapshot created: lastIndex=%d, lastTerm=%d, size=%d bytes",
 		n.id, lastIndex, lastTerm, len(data))
 
+	// Update tracking
+	n.lastSnapshotTerm = lastTerm
+
 	return nil
 }
 
@@ -150,7 +153,7 @@ func (n *Node) periodicSnapshotCheck(ctx context.Context) {
 
 	for {
 		select {
-		case <-n.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			n.maybeSnapshotByTime()

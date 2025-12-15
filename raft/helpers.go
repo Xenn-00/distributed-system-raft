@@ -57,6 +57,29 @@ func (n *Node) getLastLogTerm() uint64 {
 	return 0 // <- No log and no snapshot
 }
 
+func (n *Node) getLogTermAtIndexFast(index uint64) (uint64, bool) {
+	// Snapshot
+	if index <= n.lastSnapshotIndex {
+		return n.lastSnapshotTerm, true
+	}
+
+	if len(n.log) == 0 {
+		return 0, false
+	}
+
+	base := n.log[0].Index
+	if index < base {
+		return 0, false
+	}
+
+	offset := index - base
+	if offset >= uint64(len(n.log)) {
+		return 0, false
+	}
+
+	return n.log[offset].Term, true
+}
+
 // getLogTermAtIndex returns the term of the log entry at the given index (0 if not found)
 func (n *Node) getLogTermAtIndex(index uint64) uint64 {
 	// Check snapshot first

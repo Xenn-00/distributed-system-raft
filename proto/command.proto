@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package commandpb;
+
+
+option go_package = "github.com/Xenn-00/distributed-kv-store/proto/commandpb";
+
+// Command represents a key-value operation
+message Command {
+    // Operation type
+    enum OpType {
+      UNKNOWN = 0;
+      SET = 1;
+      DELETE = 2;
+      GET = 3; // linearizable reads
+    }
+
+    OpType op = 1;
+    string key = 2;
+    string value = 3;
+
+    int64 timestamp = 4;
+    string client_id = 5;
+    uint64 request_id = 6;
+}
+
+
+// SnapshotData represents the KV store state in a snapshot
+message SnapshotData {
+    map<string, string> data = 1;
+
+    uint64 last_applied_index = 2;
+    uint64 last_applied_term = 3;
+    int64 created_at = 4;
+}

@@ -66,12 +66,8 @@ func (n *Node) updateCommitIndexWithBatching() {
 	for N := n.commitIndex + 1; N <= lastLogIndex; N++ {
 		// Find entry at index N
 		var entryTerm uint64
-		for _, entry := range n.log {
-			if entry.Index == N {
-				entryTerm = entry.Term
-				break
-			}
-		}
+		termAtIndex, _ := n.getLogTermAtIndexFast(N)
+		entryTerm = termAtIndex
 
 		// Only commit entries from current term (Raft safety)
 		if entryTerm != n.currentTerm {
@@ -100,7 +96,7 @@ func (n *Node) updateCommitIndexWithBatching() {
 
 	// Notify all waiters in on shot
 	if n.commitIndex > oldCommit {
-		go n.NotifyBatchCommitWaiters(oldCommit, n.commitIndex)
+		n.NotifyBatchCommitWaiters(oldCommit, n.commitIndex)
 		n.triggerApply() // Use signal instead of spawn go n.applyEntries
 	}
 }
@@ -190,7 +186,7 @@ func (n *Node) applyCoordinator(ctx context.Context) {
 
 	for {
 		select {
-		case <-n.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-n.applySignal:
 			// Signal received, apply entries

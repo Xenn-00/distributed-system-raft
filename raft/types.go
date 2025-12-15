@@ -65,6 +65,7 @@ type Node struct {
 	// Snapshot tracking
 	lastSnapshotTime  time.Time
 	lastSnapshotIndex uint64
+	lastSnapshotTerm  uint64
 
 	// Event-driven notification system
 	commitWaiters sync.Map
