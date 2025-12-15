@@ -2,12 +2,12 @@ package raft
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 // maybeSnapshot checks if we should create a snapshot or not
@@ -79,6 +79,7 @@ func (n *Node) maybeSnapshotByTime() {
 }
 
 // createSnapshot saves current state and truncates log
+// Optimized: Protobuf serialization
 func (n *Node) createSnapshot() error {
 	// Get last applied log entry info
 	lastIndex := n.lastApplied
@@ -98,10 +99,19 @@ func (n *Node) createSnapshot() error {
 	// Get current KV state
 	kvState := n.kvStore.GetAll()
 
+	// Get snapshot message from pool
+	snapData := GetSnapshotData()
+	defer PutSnapshotData(snapData)
+
+	snapData.Data = kvState
+	snapData.LastAppliedIndex = lastIndex
+	snapData.LastAppliedTerm = lastTerm
+	snapData.CreatedAt = time.Now().UnixNano()
+
 	// Serialize KV state
-	data, err := json.Marshal(kvState)
+	data, err := proto.Marshal(snapData)
 	if err != nil {
-		return fmt.Errorf("failed to marshal KV state: %v", err)
+		return fmt.Errorf("failed to marshal snapshot: %v", err)
 	}
 
 	// Save snapshot to disk

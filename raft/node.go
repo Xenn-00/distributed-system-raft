@@ -2,13 +2,13 @@ package raft
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"path/filepath"
 	"time"
 
+	"github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/commandpb"
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
 	"github.com/Xenn-00/distributed-kv-store/kv"
 	"github.com/Xenn-00/distributed-kv-store/storage"
@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/proto"
 )
 
 func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) {
@@ -64,6 +65,7 @@ func NewNode(id string, peers map[string]string, dataDir string) (*Node, error) 
 }
 
 // restoreFromStorage loads persistent state from disk
+// Updated: unmarshal protobuf snapshot
 func (n *Node) restoreFromStorage() error {
 	// Load term
 	term, err := n.storage.LoadTerm()
@@ -95,17 +97,16 @@ func (n *Node) restoreFromStorage() error {
 
 		log.Printf("[%s] Loaded snapshot: lastIncludedIndex=%d, lastIncludedterm=%d", n.id, lastIncludedIndex, lastIncludedTerm)
 
-		// Restore KV state from snapshot
-		var kvState map[string]string
-		if err := json.Unmarshal(data, &kvState); err != nil {
-			return err
+		// Updated: unmarshal protobuf snapshot
+		snapData := &commandpb.SnapshotData{}
+		if err := proto.Unmarshal(data, snapData); err != nil {
+			return fmt.Errorf("failed to unmarshal snapshot: %v", err)
 		}
 
-		for k, v := range kvState {
-			n.kvStore.Set(k, v)
-		}
-
+		// Restore KV state
+		n.kvStore.RestoreFromSnapshot(snapData.Data)
 		n.lastApplied = lastIncludedIndex
+
 		if len(n.log) > 0 {
 			// Assume all restored logs were committed
 			n.commitIndex = max(lastIncludedIndex, n.log[len(n.log)-1].Index)
@@ -113,7 +114,7 @@ func (n *Node) restoreFromStorage() error {
 			n.commitIndex = lastIncludedIndex
 		}
 
-		log.Printf("[%s] Restored %d keys from snapshot", n.id, len(kvState))
+		log.Printf("[%s] Restored %d keys from snapshot", n.id, len(snapData.Data))
 	}
 
 	log.Printf("[%s] Restored from storage: term=%d, votedFor=%s, log entries=%d", n.id, n.currentTerm, n.votedFor, len(n.log))

@@ -1,22 +1,18 @@
 package kv
 
 import (
-	"encoding/json"
+	"fmt"
 	"maps"
 	"sync"
-)
 
-// Command represents a KV operation
-type Command struct {
-	Op    string `json:"op"` // "SET", "GET", "DELETE"
-	Key   string `json:"key"`
-	Value string `json:"value"`
-}
+	"github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/commandpb"
+	"google.golang.org/protobuf/proto"
+)
 
 // KVStore is the state machine
 type KVStore struct {
 	mu   sync.RWMutex
-	data map[string]string // mimic-ing a simple in-memory key-value store
+	data map[string]string // simple in-memory key-value store
 }
 
 func NewKVStore() *KVStore {
@@ -63,19 +59,33 @@ func (k *KVStore) GetAll() map[string]string {
 
 // Apply: applies a command to the KV store
 func (k *KVStore) Apply(cmdBytes []byte) error {
-	var cmd Command
-	if err := json.Unmarshal(cmdBytes, &cmd); err != nil {
-		return err
+	cmd := &commandpb.Command{}
+	if err := proto.Unmarshal(cmdBytes, cmd); err != nil {
+		return fmt.Errorf("failed to unmarshal command: %v", err)
 	}
+
 	switch cmd.Op {
-	case "SET":
+	case commandpb.Command_SET:
 		k.Set(cmd.Key, cmd.Value)
-	case "DELETE":
+	case commandpb.Command_DELETE:
 		k.Delete(cmd.Key)
+	case commandpb.Command_GET:
 		// GET doesn't modify state, so no action needed
 	default:
 		return nil
 	}
 
 	return nil
+}
+
+// RestoreFromSnapshot: restores KV state from snapshot data
+func (k *KVStore) RestoreFromSnapshot(data map[string]string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	// Clear existing data
+	k.data = make(map[string]string, len(data))
+
+	// Copy snapshot data
+	maps.Copy(k.data, data)
 }

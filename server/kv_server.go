@@ -2,16 +2,17 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"time"
 
+	"github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/commandpb"
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/kvpb"
 	"github.com/Xenn-00/distributed-kv-store/raft"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/proto"
 )
 
 type KVServer struct {
@@ -60,6 +61,7 @@ func (s *KVServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse
 }
 
 // Set handles write requests (must be on leader)
+// Optimized: Direct protobuf encoding
 func (s *KVServer) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse, error) {
 	resp := &pb.SetResponse{
 		Success: false,
@@ -76,14 +78,18 @@ func (s *KVServer) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse
 		return resp, nil
 	}
 
-	// Create command
-	cmd := map[string]any{
-		"op":    "SET",
-		"key":   req.Key,
-		"value": req.Value,
-	}
+	// Get command from pool (reduces allocations)
+	cmd := raft.GetCommand()
+	defer raft.PutCommand(cmd)
 
-	cmdBytes, err := json.Marshal(cmd)
+	// Populate command
+	cmd.Op = commandpb.Command_SET
+	cmd.Key = req.Key
+	cmd.Value = req.Value
+	cmd.Timestamp = time.Now().UnixNano()
+
+	// Marshal protobuf
+	cmdBytes, err := proto.Marshal(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal command: %v", err)
 	}
@@ -107,6 +113,7 @@ func (s *KVServer) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse
 }
 
 // Delete handles delete requests
+// Optimized: Direct protobuf encoding
 func (s *KVServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	resp := &pb.DeleteResponse{
 		Success: false,
@@ -122,12 +129,15 @@ func (s *KVServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Delet
 		return resp, nil
 	}
 
-	cmd := map[string]any{
-		"op":  "DELETE",
-		"key": req.Key,
-	}
+	// Get command from pool
+	cmd := raft.GetCommand()
+	defer raft.PutCommand(cmd)
 
-	cmdBytes, err := json.Marshal(cmd)
+	cmd.Op = commandpb.Command_DELETE
+	cmd.Key = req.Key
+	cmd.Timestamp = time.Now().UnixNano()
+
+	cmdBytes, err := proto.Marshal(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal command: %v", err)
 	}

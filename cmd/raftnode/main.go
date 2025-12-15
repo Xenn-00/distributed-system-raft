@@ -18,9 +18,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/commandpb"
 	"github.com/Xenn-00/distributed-kv-store/raft"
 	"github.com/Xenn-00/distributed-kv-store/server"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
 
 func main() {
@@ -216,13 +218,16 @@ func startCLI(node *raft.Node, nodeID string) {
 				continue
 			}
 
-			// Create command
-			cmdMap := map[string]any{
-				"op":    "SET",
-				"key":   parts[1],
-				"value": parts[2],
-			}
-			cmdBytes, err := json.Marshal(cmdMap)
+			// Create protobuf command
+			cmdProto := raft.GetCommand()
+			defer raft.PutCommand(cmdProto)
+
+			cmdProto.Op = commandpb.Command_SET
+			cmdProto.Key = parts[1]
+			cmdProto.Value = parts[2]
+			cmdProto.Timestamp = time.Now().UnixNano()
+
+			cmdBytes, err := proto.Marshal(cmdProto)
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
 				continue
@@ -270,12 +275,15 @@ func startCLI(node *raft.Node, nodeID string) {
 				continue
 			}
 
-			// Create command
-			cmdMap := map[string]any{
-				"op":  "DELETE",
-				"key": parts[1],
-			}
-			cmdBytes, err := json.Marshal(cmdMap)
+			// Create protobuf command
+			cmdProto := raft.GetCommand()
+			defer raft.PutCommand(cmdProto)
+
+			cmdProto.Op = commandpb.Command_DELETE
+			cmdProto.Key = parts[1]
+			cmdProto.Timestamp = time.Now().UnixNano()
+
+			cmdBytes, err := json.Marshal(cmdProto)
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
 				continue

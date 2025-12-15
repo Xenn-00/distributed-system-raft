@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
@@ -23,8 +24,9 @@ type PeerReplicator struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	inflightQ chan *replicationTask // Queue of in-flight tasks
-	wg        sync.WaitGroup
+	inflightQ        chan *replicationTask // Queue of in-flight tasks
+	snapshotInflight atomic.Bool
+	wg               sync.WaitGroup
 }
 
 // replicationTask represents a single AppendEntries RPC
@@ -166,7 +168,7 @@ func (pr *PeerReplicator) drainInflightQueue() {
 
 // processTaskWithTimeout process task with context check
 func (pr *PeerReplicator) processTaskWithTimeout(task *replicationTask) {
-	timer := time.NewTicker(2 * RPCTimeout)
+	timer := time.NewTimer(2 * RPCTimeout)
 	defer timer.Stop()
 
 	select {
@@ -183,41 +185,21 @@ func (pr *PeerReplicator) processTaskWithTimeout(task *replicationTask) {
 
 // maybeSendBatch sends a batch of entries if needed
 func (pr *PeerReplicator) maybeSendBatch() {
+	pr.node.mu.Lock()
 	// Early context check
 	if pr.ctx.Err() != nil {
-		return
-	}
-
-	// Try lock with timeout (non-blocking)
-	lockAcquired := make(chan struct{})
-	go func() {
-		pr.node.mu.Lock()
-		close(lockAcquired)
-	}()
-
-	select {
-	case <-lockAcquired:
-		// Got lock
-		defer pr.node.mu.Unlock()
-	case <-time.After(100 * time.Millisecond):
-		// Lock timeout, skip this cycle
-		return
-	case <-pr.ctx.Done():
-		// Context cancelled while waiting
-		return
-	}
-
-	// Check context again after lock
-	if pr.ctx.Err() != nil {
+		pr.node.mu.Unlock()
 		return
 	}
 
 	if pr.node.state != Leader {
+		pr.node.mu.Unlock()
 		return
 	}
 
 	// Check in-flight limit
 	if len(pr.inflightQ) >= MaxInFlightRPCs {
+		pr.node.mu.Unlock()
 		return // Too many in-flight
 	}
 
@@ -236,21 +218,22 @@ func (pr *PeerReplicator) maybeSendBatch() {
 	// Peer too far behind - need snapshot
 	if nextIdx < firstLogIndex {
 		log.Printf("[%s] Peer %s needs snapshot (next=%d, first=%d)", pr.node.id, pr.peerID, nextIdx, firstLogIndex)
+		pr.node.mu.Unlock()
 		// Send snapshot in background
-		go func() {
-			select {
-			case <-pr.ctx.Done():
-				return
-			default:
+		if pr.snapshotInflight.CompareAndSwap(false, true) {
+			go func() {
+				defer pr.snapshotInflight.Store(false)
 				pr.node.sendSnapshot(pr.peerID)
-			}
-		}()
+			}()
+		}
 		return
 	}
 
 	// Prepare request
 	term := pr.node.currentTerm
 	req := pr.node.prepareAppendEntriesRequest(nextIdx) // call within lock
+
+	pr.node.mu.Unlock()
 
 	// Create task
 	task := &replicationTask{
@@ -261,12 +244,12 @@ func (pr *PeerReplicator) maybeSendBatch() {
 
 	// Track in-flight
 	select {
-	case pr.inflightQ <- task: // Successfully queued
-		pr.wg.Add(1)
-		go pr.sendRPC(task, term)
 	case <-pr.ctx.Done():
 		// Context cancelled while queuing
 		return
+	case pr.inflightQ <- task: // Successfully queued
+		pr.wg.Add(1)
+		go pr.sendRPC(task, term)
 	default:
 		// Queue full (shouldn't happen. but be defensive)
 		log.Printf("[%s] In-flight queue full for %s", pr.node.id, pr.peerID)
@@ -292,9 +275,9 @@ func (pr *PeerReplicator) sendRPC(task *replicationTask, term uint64) {
 	}
 
 	select {
-	case task.respCh <- resp:
 	case <-pr.ctx.Done():
 		return
+	case task.respCh <- resp:
 	}
 }
 

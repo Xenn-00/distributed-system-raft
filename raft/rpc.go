@@ -2,11 +2,11 @@ package raft
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 
+	"github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/commandpb"
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
-	"github.com/Xenn-00/distributed-kv-store/kv"
+	"google.golang.org/protobuf/proto"
 )
 
 // RPC handlers
@@ -272,6 +272,7 @@ func (n *Node) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 }
 
 // InstallSnapshot handles incoming InstallSnapshot RPCs
+// Unmarshal protobuf snapshot data
 func (n *Node) InstallSnapshot(ctx context.Context, req *pb.InstallSnapshotRequest) (*pb.InstallSnapshotResponse, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -320,20 +321,18 @@ func (n *Node) InstallSnapshot(ctx context.Context, req *pb.InstallSnapshotReque
 		return resp, nil
 	}
 
-	// Apply snapshot to state machine
-	var kvState map[string]string
-	if err := json.Unmarshal(req.Data, &kvState); err != nil {
+	// Updated: unmarshal protobuf snapshot data
+	snapData := &commandpb.SnapshotData{}
+	if err := proto.Unmarshal(req.Data, snapData); err != nil {
 		log.Printf("[%s] Failed to unmarshal snapshot data: %v", n.id, err)
 		return resp, nil
 	}
 
-	// Clear current KV store
-	n.kvStore = kv.NewKVStore()
-	for k, v := range kvState {
-		n.kvStore.Set(k, v)
-	}
+	// Restore KV state from snapshot
+	n.kvStore.RestoreFromSnapshot(snapData.Data)
+	n.lastApplied = req.LastIncludedIndex
 
-	log.Printf("[%s] Applied snapshot: %d keys restored", n.id, len(kvState))
+	log.Printf("[%s] Restored %d keys from snapshot", n.id, len(snapData.Data))
 
 	// Discard log entries covered by snapshot
 	var newLog []*pb.LogEntry

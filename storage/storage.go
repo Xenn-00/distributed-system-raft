@@ -27,10 +27,6 @@ type Storage interface {
 	LoadSnapshot() (lastIncludedIndex, lastIncludedTerm uint64, data []byte, err error)
 	HasSnapshot() bool
 
-	// KV state (for snapshot)
-	SaveKVState(data map[string]string) error
-	LoadKVState() (map[string]string, error)
-
 	// Lifecycle
 	Close() error
 }

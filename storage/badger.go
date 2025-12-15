@@ -1,12 +1,12 @@
 package storage
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 
 	pb "github.com/Xenn-00/distributed-kv-store/github.com/Xenn-00/distributed-kv-store/proto/raftpb"
 	"github.com/dgraph-io/badger/v4"
+	"google.golang.org/protobuf/proto"
 )
 
 // Key prefixes, all in bytes because all KV db like BadgerDB, LevelDB, RocksDB etc only store bytes
@@ -17,7 +17,6 @@ var (
 	keySnapshotIndex = []byte("snap:index")
 	keySnapshotTerm  = []byte("snap:term")
 	keySnapshotData  = []byte("snap:data")
-	keyKVState       = []byte("kv:state")
 )
 
 type BadgerStorage struct {
@@ -93,10 +92,13 @@ func (s *BadgerStorage) LoadVote() (string, error) {
 }
 
 // ======== Log ========
+// Optimized: Protobuf serialization
 func (s *BadgerStorage) AppendLog(entry *pb.LogEntry) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		key := logKey(entry.Index)
-		data, err := json.Marshal(entry)
+
+		// Marshal protobuf (LogEntry is already proto)
+		data, err := proto.Marshal(entry)
 		if err != nil {
 			return err
 		}
@@ -106,11 +108,14 @@ func (s *BadgerStorage) AppendLog(entry *pb.LogEntry) error {
 }
 
 // AppendLogBatch appends multile log entries atomically
+// Optimized: Protobuf serialization
 func (s *BadgerStorage) AppendLogBatch(entries []*pb.LogEntry) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		for _, entry := range entries {
 			key := logKey(entry.Index)
-			data, err := json.Marshal(entry)
+
+			// Marshal protobuf (LogEntry is already proto)
+			data, err := proto.Marshal(entry)
 			if err != nil {
 				return err
 			}
@@ -132,7 +137,8 @@ func (s *BadgerStorage) GetLog(index uint64) (*pb.LogEntry, error) {
 
 		return item.Value(func(val []byte) error {
 			entry = &pb.LogEntry{}
-			return json.Unmarshal(val, entry)
+			// Proto unmarshal
+			return proto.Unmarshal(val, entry)
 		})
 	})
 	return entry, err
@@ -153,7 +159,8 @@ func (s *BadgerStorage) GetAllLogs() ([]*pb.LogEntry, error) {
 
 			err := item.Value(func(val []byte) error {
 				entry := &pb.LogEntry{}
-				if err := json.Unmarshal(val, entry); err != nil {
+				// Proto unmarshal
+				if err := proto.Unmarshal(val, entry); err != nil {
 					return err
 				}
 				logs = append(logs, entry)
@@ -187,7 +194,8 @@ func (s *BadgerStorage) GetLogsFrom(startIndex uint64) ([]*pb.LogEntry, error) {
 
 			err := item.Value(func(val []byte) error {
 				entry := &pb.LogEntry{}
-				if err := json.Unmarshal(val, entry); err != nil {
+				// Proto unmarshal
+				if err := proto.Unmarshal(val, entry); err != nil {
 					return err
 				}
 				logs = append(logs, entry)
@@ -251,7 +259,8 @@ func (s *BadgerStorage) GetLastLogIndex() (uint64, error) {
 		item := it.Item()
 		return item.Value(func(val []byte) error {
 			entry := &pb.LogEntry{}
-			if err := json.Unmarshal(val, entry); err != nil {
+			// Proto unmarshal
+			if err := proto.Unmarshal(val, entry); err != nil {
 				return err
 			}
 			lastIndex = entry.Index
@@ -263,7 +272,8 @@ func (s *BadgerStorage) GetLastLogIndex() (uint64, error) {
 }
 
 // ======== Snapshot ========
-
+// Snapshot data is already protobuf from snapshot.go
+// We just store the raw proto bytes here
 func (s *BadgerStorage) SaveSnapshot(lastIncludedIndex, lastIncludedTerm uint64, data []byte) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		if err := txn.Set(keySnapshotIndex, uint64ToBytes(lastIncludedIndex)); err != nil {
@@ -335,39 +345,6 @@ func (s *BadgerStorage) HasSnapshot() bool {
 	})
 
 	return hasSnap
-}
-
-// ======== KV State ========
-
-func (s *BadgerStorage) SaveKVState(data map[string]string) error {
-	return s.db.Update(func(txn *badger.Txn) error {
-		val, err := json.Marshal(data)
-		if err != nil {
-			return err
-		}
-		return txn.Set(keyKVState, val)
-	})
-}
-
-func (s *BadgerStorage) LoadKVStore() (map[string]string, error) {
-	var data map[string]string
-
-	err := s.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(keyKVState)
-		if err != nil {
-			if err == badger.ErrKeyNotFound {
-				data = make(map[string]string)
-				return nil
-			}
-			return err
-		}
-
-		return item.Value(func(val []byte) error {
-			return json.Unmarshal(val, &data)
-		})
-	})
-
-	return data, err
 }
 
 // ======== Lifecycle ========
